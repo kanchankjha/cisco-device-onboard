@@ -1,0 +1,23 @@
+target_version: "26.2"
+
+image:
+  destination: "bootflash:"
+  skip_if_present: false
+  source:
+    path: /path/to/approved-iosxe-image.bin
+    server:
+      ip: 192.0.2.20
+      username: scp-user
+      password: replace-me
+
+wan_interfaces:
+  - Te0/0/8
+  - Te0/0/9
+
+timeouts:
+  copy: 1800
+  install: 600
+  reboot: 1800
+  poll_interval: 15
+  prompt: 180
+  dhcp: 300

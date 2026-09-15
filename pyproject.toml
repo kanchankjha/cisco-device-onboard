@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cisco-device-onboard"
+version = "0.1.0"
+description = "Dedicated console firmware upgrade and Meraki appliance onboarding tools"
+requires-python = ">=3.10"
+dependencies = [
+  "pexpect>=4.9",
+  "PyYAML>=6.0",
+  "requests>=2.31",
+]
+
+[project.scripts]
+binary-da-console-upgrade = "cisco_device_onboard.console_upgrade:main"
+binary-da-meraki-onboard = "cisco_device_onboard.meraki_onboard:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

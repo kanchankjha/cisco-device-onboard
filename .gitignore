@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+reports/
+upgrade-reports/
+*.local.yaml
+device_upgrade.yaml
+onboarding-result.json
+*.json.tmp
+.pytest_cache/
+build/
+dist/
+*.egg-info/
