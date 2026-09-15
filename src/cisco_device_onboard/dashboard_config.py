@@ -1,4 +1,4 @@
-"""Batch Meraki API onboarding command driven by the shared device CSV."""
+"""Batch Meraki Dashboard configuration command driven by the shared device CSV."""
 
 from __future__ import annotations
 
