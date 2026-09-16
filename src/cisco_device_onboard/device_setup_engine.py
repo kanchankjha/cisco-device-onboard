@@ -3,8 +3,8 @@
 
 Only PyYAML and pexpect are required.  This file can be copied without the
 repository: it does not import the repository's framework, pyATS, or testbed
-files.  It opens an interactive SSH or Telnet console, uses the IOS-XE
-``copy scp:`` command, and then performs the upgrade and configuration workflow
+files.  It opens an interactive SSH or Telnet console, uses the IOS-XE image
+copy command, and then performs the upgrade and configuration workflow
 described by the YAML input.
 """
 
@@ -45,16 +45,25 @@ PROMPT_PATTERN = r"(?m)[A-Za-z0-9_.-]+(?:\([^\r\n)]*\))?[>#][ \t]*(?=\r?\n|$)"
 PASSWORD_PATTERN = r"(?i)(?:password|passphrase)\s*:"
 USERNAME_PATTERN = r"(?i)(?:username|login)\s*:"
 RETURN_PATTERN = r"(?i)press\s+(?:return|enter)\s+to\s+get\s+started!?"
+BASIC_SETUP_PATTERN = r"(?i)(?:initial configuration dialog|basic configuration dialog|basic management setup).*?(?:\[yes/no\]|\(yes/no\)|:)"
+AUTOINSTALL_PATTERN = r"(?i)(?:terminate|abort|stop)\s+autoinstall.*?(?:\[yes\]|\[yes/no\]|\(yes/no\)|:)"
+SAVE_CONFIG_PATTERN = r"(?i)(?:save|would you like to save).*configuration.*?(?:\[yes/no\]|\(yes/no\)|:)"
+REMOTE_HOST_PATTERN = r"(?i)(?:address|name)\s+of\s+remote\s+host.*?(?:\?|:)"
+SOURCE_FILENAME_PATTERN = r"(?i)(?:source\s+filename|source\s+file\s+name).*?(?:\?|:)"
 COPY_FAILURE_MARKERS = (
     "%error",
+    "%bad",
     "no such file",
     "permission denied",
     "authentication failed",
+    "login failed",
+    "not logged in",
     "connection refused",
     "connection timed out",
     "invalid input",
     "transfer failed",
 )
+MAX_CONSOLE_WAKEUPS = 6
 
 
 class UpgradeConfigError(ValueError):
@@ -115,6 +124,10 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     for key in ("ip", "username", "password"):
         _required(server, key, "image.source.server")
 
+    transfer_protocol = str(source.get("protocol", "scp")).strip().lower()
+    if transfer_protocol not in {"scp", "ftp"}:
+        raise UpgradeConfigError("'image.source.protocol' must be 'scp' or 'ftp'")
+
     source_path = str(_required(source, "path", "image.source")).strip()
     if not source_path.startswith("/") or not Path(source_path).name:
         raise UpgradeConfigError(
@@ -149,6 +162,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     config["image"]["source"] = source
     config["image"]["source"]["server"] = server
     config["image"]["source"]["path"] = source_path
+    config["image"]["source"]["protocol"] = transfer_protocol
     config["protocol"] = protocol
     target_version = str(config.get("target_version", "26.2")).strip()
     if not re.fullmatch(r"\d+(?:\.\d+)+", target_version):
@@ -219,7 +233,7 @@ def _target_is_active(show_version: str, image_name: str) -> bool:
 
 
 def _copy_failed(output: str) -> bool:
-    """Return whether IOS-XE reported a definite SCP/copy failure."""
+    """Return whether IOS-XE reported a definite image transfer failure."""
 
     output_lower = output.lower()
     return any(marker in output_lower for marker in COPY_FAILURE_MARKERS)
@@ -369,6 +383,9 @@ class ConsoleSession:
                     PASSWORD_PATTERN,
                     USERNAME_PATTERN,
                     RETURN_PATTERN,
+                    BASIC_SETUP_PATTERN,
+                    AUTOINSTALL_PATTERN,
+                    SAVE_CONFIG_PATTERN,
                     PROMPT_PATTERN,
                     pexpect.EOF,
                     pexpect.TIMEOUT,
@@ -400,10 +417,28 @@ class ConsoleSession:
                     self.config["timeouts"]["prompt"]
                 )
             elif index == 4:
+                LOG.info("Skipping basic setup dialog")
+                self.child.sendline("no")
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 5:
+                LOG.info("Terminating autoinstall dialog")
+                self.child.sendline("yes")
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 6:
+                LOG.info("Declining setup configuration save prompt")
+                self.child.sendline("no")
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 7:
                 LOG.debug("Console prompt detected")
                 self._prepare_terminal()
                 return
-            elif index == 5:
+            elif index == 8:
                 raise RuntimeError("Console connection closed during login")
             else:
                 observed = (self.child.before or "").lower()
@@ -414,25 +449,30 @@ class ConsoleSession:
                     LOG.info("Console prompt has not appeared; pressing Enter again")
                     self.child.send("\r")
                     continue
-                if command == "telnet" and not any(
-                    marker in observed
-                    for marker in ("connected to", "escape character")
-                ):
-                    raise TimeoutError(
-                        "Timed out connecting to Telnet endpoint "
-                        f"{self.connection['ip']}:{self.connection.get('port', 23)}"
-                    )
-                if command == "telnet" and wakeup_attempts < 2:
+                if wakeup_attempts < MAX_CONSOLE_WAKEUPS:
                     wakeup_attempts += 1
-                    LOG.debug("Telnet console is quiet; sending wake-up Enter")
+                    LOG.debug("Console is quiet; sending wake-up Enter")
                     self.child.send("\r")
                     continue
-                raise TimeoutError("Timed out waiting for the console login prompt")
+                raise TimeoutError(
+                    "Timed out waiting for the console login prompt after wake-up attempts"
+                )
 
     def _prepare_terminal(self) -> None:
+        self._reset_to_exec_prompt()
         self._enter_privileged_mode()
         self.execute("terminal length 0")
         self.execute("terminal width 0")
+
+    def _reset_to_exec_prompt(self) -> None:
+        if self.child is None:
+            raise RuntimeError("Console is not connected")
+        self.child.send("\x1a")
+        try:
+            self.child.expect(PROMPT_PATTERN, timeout=10)
+        except pexpect.TIMEOUT:
+            self.child.send("\r")
+            self.child.expect(PROMPT_PATTERN, timeout=10)
 
     def _enter_privileged_mode(self) -> None:
         if self.child is None:
@@ -471,6 +511,9 @@ class ConsoleSession:
     def copy_image(self, config: Dict[str, Any], image_name: str) -> str:
         source = config["image"]["source"]
         server = source["server"]
+        transfer_protocol = str(source.get("protocol", "scp")).strip().lower()
+        if transfer_protocol not in {"scp", "ftp"}:
+            raise UpgradeConfigError("'image.source.protocol' must be 'scp' or 'ftp'")
         destination = str(config["image"].get("destination", "bootflash:")).strip()
         if not destination.endswith(":"):
             destination += ":"
@@ -480,22 +523,26 @@ class ConsoleSession:
                 LOG.info("Image already exists on the device; skipping copy")
                 return output
 
-        # This IOS-XE build accepts the SCP URL form.  The double slash after
+        # IOS-XE accepts the URL form.  The double slash after
         # the server preserves the leading slash as an absolute server path.
-        scp_path = source["path"].lstrip("/")
+        remote_path = source["path"].lstrip("/")
         command = (
-            f"copy scp://{server['username']}@{server['ip']}//{scp_path} "
+            f"copy {transfer_protocol}://{server['username']}@{server['ip']}//{remote_path} "
             f"{destination}{image_name}"
         )
-        LOG.info("Copying %s to %s", source["path"], destination)
+        LOG.info("Copying %s to %s by %s", source["path"], destination, transfer_protocol.upper())
         self.child.sendline(command)
         password_sent = False
+        username_sent = False
         output = ""
         while True:
             index = self.child.expect(
                 [
                     r"(?i)are you sure you want to continue connecting.*",
                     PASSWORD_PATTERN,
+                    USERNAME_PATTERN,
+                    REMOTE_HOST_PATTERN,
+                    SOURCE_FILENAME_PATTERN,
                     r"(?i)destination filename.*",
                     r"(?i)\[confirm\].*",
                     PROMPT_PATTERN,
@@ -510,32 +557,43 @@ class ConsoleSession:
             elif index == 1:
                 if password_sent:
                     raise RuntimeError(
-                        "SCP requested the server password more than once"
+                        f"{transfer_protocol.upper()} requested the server password more than once"
                     )
                 self.child.sendline(str(server["password"]))
                 password_sent = True
             elif index == 2:
-                self.child.sendline("")
+                if username_sent:
+                    raise RuntimeError(
+                        f"{transfer_protocol.upper()} requested the server username more than once"
+                    )
+                self.child.sendline(str(server["username"]))
+                username_sent = True
             elif index == 3:
-                self.child.sendline("")
+                self.child.sendline(str(server["ip"]))
             elif index == 4:
+                self.child.sendline(str(source["path"]))
+            elif index == 5:
+                self.child.sendline("")
+            elif index == 6:
+                self.child.sendline("")
+            elif index == 7:
                 if _copy_failed(output):
-                    raise RuntimeError(f"SCP copy failed:\n{output}")
+                    raise RuntimeError(f"{transfer_protocol.upper()} copy failed:\n{output}")
                 verification = self.execute(f"dir {destination}{image_name}")
                 combined_output = f"{output}\n{verification}"
                 if _copy_failed(verification) or not _image_is_present(
                     combined_output, image_name
                 ):
                     raise RuntimeError(
-                        f"Image {image_name} was not found on the device after SCP copy. "
-                        f"SCP output:\n{output}\nDirectory output:\n{verification}"
+                        f"Image {image_name} was not found on the device after {transfer_protocol.upper()} copy. "
+                        f"{transfer_protocol.upper()} output:\n{output}\nDirectory output:\n{verification}"
                     )
-                LOG.info("SCP copy completed and image verified: %s", image_name)
+                LOG.info("%s copy completed and image verified: %s", transfer_protocol.upper(), image_name)
                 return verification
-            elif index == 5:
-                raise RuntimeError(f"Console closed during SCP copy: {output}")
+            elif index == 8:
+                raise RuntimeError(f"Console closed during {transfer_protocol.upper()} copy: {output}")
             else:
-                raise TimeoutError(f"Timed out during SCP copy: {output}")
+                raise TimeoutError(f"Timed out during {transfer_protocol.upper()} copy: {output}")
 
     def install_image(self, config: Dict[str, Any], image_name: str) -> str:
         destination = str(config["image"].get("destination", "bootflash:")).strip()

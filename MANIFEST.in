@@ -1,0 +1,7 @@
+include README.md
+include pyproject.toml
+include install_offline.sh
+include install_offline.ps1
+include build_offline_bundle.sh
+recursive-include examples *.csv *.yaml
+recursive-include offline/wheelhouse *

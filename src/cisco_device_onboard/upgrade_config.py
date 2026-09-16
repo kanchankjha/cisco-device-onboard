@@ -34,6 +34,9 @@ def load_upgrade_config(path: Path) -> dict[str, Any]:
     image = config.get("image") or {}
     source = image.get("source") or {}
     server = source.get("server") or {}
+    transfer_protocol = str(source.get("protocol", "scp")).strip().lower()
+    if transfer_protocol not in {"scp", "ftp"}:
+        raise UpgradeConfigError("image.source.protocol must be 'scp' or 'ftp'")
     required = {
         "target_version": target_version,
         "image.path": source.get("path"),
@@ -50,4 +53,6 @@ def load_upgrade_config(path: Path) -> dict[str, Any]:
     config["target_version"] = target_version
     config["wan_interfaces"] = [str(item).strip() for item in wans]
     config.setdefault("image", {}).setdefault("destination", "bootflash:")
+    config["image"].setdefault("source", source)
+    config["image"]["source"]["protocol"] = transfer_protocol
     return config

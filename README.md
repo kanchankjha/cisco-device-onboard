@@ -1,11 +1,9 @@
 # Cisco Device Onboard
 
-An independent, batch-oriented package for two onboarding prerequisites:
+Batch tools for Cisco appliance onboarding:
 
-1. Upgrade Cisco IOS-XE appliances through SSH/Telnet console when the running version is below the configured target (26.2 by default), enable WAN DHCP, enable cloud management, and save the configuration.
-2. Claim appliances into a Meraki organization, create or reuse a named appliance network, claim the appliance into it, and verify the assignment through the Meraki Dashboard API.
-
-This project is intentionally standalone. It has no portal imports and does not perform VLAN, port, MR, AutoVPN, CLI Profile, or customer-facing configuration.
+- `console-upgrade`: upgrade IOS-XE appliances through SSH/Telnet console, enable WAN DHCP, enable cloud management, and save the configuration.
+- `dashboard-config`: claim appliances into Meraki Dashboard, create or reuse appliance networks, and verify assignment.
 
 ## Install
 
@@ -17,20 +15,63 @@ source .venv/bin/activate
 python3 -m pip install -e .
 ```
 
-The package installation handles `pexpect`, `PyYAML`, and `requests`. The console utility invokes the existing system SSH/Telnet client; no device-specific Python SDK is required.
+Dependencies are installed automatically. The console workflow uses the host SSH/Telnet client.
+
+## Offline install
+
+The tarball includes `offline/wheelhouse` and setup scripts for offline installs.
+
+On Linux or macOS:
+
+```bash
+tar -xzf cisco_device_onboard-0.1.0.tar.gz
+cd cisco_device_onboard-0.1.0
+./install_offline.sh
+source .venv/bin/activate
+```
+
+On Windows PowerShell:
+
+```powershell
+tar -xzf cisco_device_onboard-0.1.0.tar.gz
+cd cisco_device_onboard-0.1.0
+.\install_offline.ps1
+.\.venv\Scripts\Activate.ps1
+```
+
+Verify the commands:
+
+```bash
+console-upgrade --help
+dashboard-config --help
+```
+
+Rebuild the offline tarball on a machine with internet access:
+
+```bash
+./build_offline_bundle.sh
+```
+
+The bundled wheels target Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x64 with CPython 3.12. For another Python version, rebuild with matching values:
+
+```bash
+PYTHON_VERSION=311 PYTHON_ABI=cp311 ./build_offline_bundle.sh
+```
+
+Override `TARGET_PLATFORMS` to build a smaller or different wheelhouse. On Windows, validate local SSH/Telnet behavior before running `console-upgrade` in production.
 
 ## Input files
 
-The CSV can contain additional columns; they are retained by the parser and ignored unless documented by a command. The common format is:
+CSV format:
 
 ```csv
 network-name,appliance-serial-number,console-ip,console-port
 Example home,AAAA-BBBB-CCCC,192.0.2.10,8235
 ```
 
-The console command requires `appliance-serial-number`, `console-ip`, and `console-port`. The API onboarding command requires `network-name` and `appliance-serial-number`; console columns may be blank or omitted.
+`console-upgrade` requires `appliance-serial-number`, `console-ip`, and `console-port`. `dashboard-config` requires `network-name` and `appliance-serial-number`.
 
-Copy the example YAML to a local file and replace the image/server values. Do not commit real credentials. The YAML contains the approved image path and SCP server details; console and Meraki credentials are supplied through environment variables.
+Copy `examples/device_upgrade.example.yaml` to a local YAML file and replace the image server values. Set `image.source.protocol` to `scp` or `ftp`; SCP is the default and recommended option. Supply console and Meraki credentials through environment variables.
 
 ## Console upgrade
 
@@ -56,13 +97,13 @@ console-upgrade \
   --report-dir upgrade-reports
 ```
 
-The engine never downgrades a device. It reads `show version`; when the running version is already at or above `target_version`, the image copy/install/reboot portion is marked `SKIPPED`, while WAN DHCP and cloud-management configuration are still verified and saved. Each device gets a JSON report. Reports and temporary per-device YAML files are created with restrictive permissions and secrets are redacted from wrapper output.
+Run one platform type per batch. Devices with different platform families, console behaviors, image trains, or WAN interface naming should use separate CSV/YAML batches so each run has a single validated upgrade path.
 
-Optional per-row CSV columns `console-protocol` and `console-username` override the command defaults. The protocol default is Telnet.
+The engine never downgrades a device. If the running version is already at or above `target_version`, image copy/install/reboot is marked `SKIPPED`; WAN DHCP and cloud management are still verified and saved. The appliance must reach the configured SCP/FTP server. Optional CSV columns `console-protocol` and `console-username` override defaults.
 
 ## Dashboard configuration
 
-Dry-run is read-only and does not require an API key:
+Dry-run:
 
 ```bash
 dashboard-config \
@@ -70,7 +111,7 @@ dashboard-config \
   --dry-run
 ```
 
-Apply the inventory claim, network creation/reuse, network claim, and read-back verification:
+Apply changes:
 
 ```bash
 export MERAKI_API_KEY='your-key'
@@ -80,15 +121,14 @@ dashboard-config \
   --report onboarding-result.json
 ```
 
-The organization defaults to the configured organization and can be overridden with `MERAKI_ORG_ID` or `--org-id`. The API base URL can be overridden with `MERAKI_API_BASE_URL` or `--base-url`. The key is only read from the selected environment variable and is never printed or written to the result report.
-
-If an appliance is already assigned to a network, the row fails with the inventory network ID so it can be cleaned up before retrying. Existing exact-name networks are reused; otherwise an appliance-only network is created.
+Override organization and API base URL with `MERAKI_ORG_ID` / `--org-id` and `MERAKI_API_BASE_URL` / `--base-url`. Existing exact-name networks are reused.
 
 ## Safety and repository hygiene
 
-- `--dry-run` is the only planning mode; `--apply` is required for Meraki writes.
-- Real YAML, reports, virtual environments, and local secrets are ignored by Git.
-- Use a short-lived, least-privilege Meraki API key where possible and revoke it after the batch.
+- Use `--dry-run` before production runs.
+- `--apply` is required for Meraki writes.
+- Run one platform type per batch.
+- Do not commit real credentials, local YAML, reports, or secrets.
 - Test with one appliance before running a larger CSV.
 
 ## Development

@@ -4,6 +4,7 @@ image:
   destination: "bootflash:"
   skip_if_present: false
   source:
+    protocol: scp
     path: /path/to/approved-iosxe-image.bin
     server:
       ip: 192.0.2.20
