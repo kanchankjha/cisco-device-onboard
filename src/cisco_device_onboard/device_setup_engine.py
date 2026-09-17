@@ -48,6 +48,7 @@ RETURN_PATTERN = r"(?i)press\s+(?:return|enter)\s+to\s+get\s+started!?"
 BASIC_SETUP_PATTERN = r"(?i)(?:initial configuration dialog|basic configuration dialog|basic management setup).*?(?:\[yes/no\]|\(yes/no\)|:)"
 AUTOINSTALL_PATTERN = r"(?i)(?:terminate|abort|stop)\s+autoinstall.*?(?:\[yes\]|\[yes/no\]|\(yes/no\)|:)"
 SAVE_CONFIG_PATTERN = r"(?i)(?:save|would you like to save).*configuration.*?(?:\[yes/no\]|\(yes/no\)|:)"
+SETUP_SELECTION_PATTERN = r"(?i)enter\s+your\s+selection\s+\[2\]\s*:"
 REMOTE_HOST_PATTERN = r"(?i)(?:address|name)\s+of\s+remote\s+host.*?(?:\?|:)"
 SOURCE_FILENAME_PATTERN = r"(?i)(?:source\s+filename|source\s+file\s+name).*?(?:\?|:)"
 COPY_FAILURE_MARKERS = (
@@ -386,6 +387,7 @@ class ConsoleSession:
                     BASIC_SETUP_PATTERN,
                     AUTOINSTALL_PATTERN,
                     SAVE_CONFIG_PATTERN,
+                    SETUP_SELECTION_PATTERN,
                     PROMPT_PATTERN,
                     pexpect.EOF,
                     pexpect.TIMEOUT,
@@ -435,10 +437,16 @@ class ConsoleSession:
                     self.config["timeouts"]["prompt"]
                 )
             elif index == 7:
+                LOG.info("Going to the IOS prompt without saving setup configuration")
+                self.child.sendline("0")
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 8:
                 LOG.debug("Console prompt detected")
                 self._prepare_terminal()
                 return
-            elif index == 8:
+            elif index == 9:
                 raise RuntimeError("Console connection closed during login")
             else:
                 observed = (self.child.before or "").lower()

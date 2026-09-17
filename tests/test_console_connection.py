@@ -106,7 +106,7 @@ class ConsoleConnectionTests(unittest.TestCase):
                 2,
                 1,
                 3,
-                (7, "", "Router>"),
+                (8, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -123,7 +123,8 @@ class ConsoleConnectionTests(unittest.TestCase):
                 4,
                 5,
                 6,
-                (7, "", "Router>"),
+                7,
+                (8, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -131,15 +132,20 @@ class ConsoleConnectionTests(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            [("sendline", "no"), ("sendline", "yes"), ("sendline", "no")],
-            [item for item in sent if item[0] == "sendline"][:3],
+            [
+                ("sendline", "no"),
+                ("sendline", "yes"),
+                ("sendline", "no"),
+                ("sendline", "0"),
+            ],
+            [item for item in sent if item[0] == "sendline"][:4],
         )
 
     def test_quiet_ssh_console_gets_wakeup_enter(self):
         sent = self.run_connect(
             [
-                9,
-                (7, "", "Router>"),
+                10,
+                (8, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
