@@ -14,7 +14,8 @@ fi
 
 echo "Installing from offline wheelhouse: $WHEELHOUSE"
 "$PYTHON_BIN" -m venv "$VENV_DIR"
-"$VENV_DIR/bin/python" -m pip install --no-index --find-links "$WHEELHOUSE" 'setuptools>=68' 'wheel>=0.41'
+"$VENV_DIR/bin/python" -m pip install --no-index --find-links "$WHEELHOUSE" \
+  'setuptools>=58,<69' 'wheel>=0.37.1,<0.48'
 "$VENV_DIR/bin/python" -m pip install --no-index --find-links "$WHEELHOUSE" --no-build-isolation "$ROOT_DIR"
 
 "$VENV_DIR/bin/console-upgrade" --help >/dev/null

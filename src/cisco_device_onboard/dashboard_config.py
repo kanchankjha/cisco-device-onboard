@@ -1,13 +1,11 @@
 """Batch Meraki Dashboard configuration command driven by the shared device CSV."""
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -31,7 +29,7 @@ class MerakiApi:
         self.session = requests.Session()
         self.session.headers.update({"X-Cisco-Meraki-API-Key": api_key, "Accept": "application/json"})
 
-    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    def request(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
         response = self.session.request(method, self.base_url + path, json=payload, timeout=self.timeout)
         if not response.ok:
             try:
@@ -44,23 +42,23 @@ class MerakiApi:
     def get(self, path: str) -> Any:
         return self.request("GET", path)
 
-    def post(self, path: str, payload: dict[str, Any]) -> Any:
+    def post(self, path: str, payload: Dict[str, Any]) -> Any:
         return self.request("POST", path, payload)
 
 
-def inventory_device(api: MerakiApi, org_id: str, serial: str) -> dict[str, Any] | None:
+def inventory_device(api: MerakiApi, org_id: str, serial: str) -> Optional[Dict[str, Any]]:
     devices = api.get(f"/organizations/{org_id}/inventory/devices")
     if isinstance(devices, dict):
         devices = devices.get("items", devices.get("devices", []))
     return next((item for item in devices or [] if str(item.get("serial", "")).upper() == serial), None)
 
 
-def network_by_name(api: MerakiApi, org_id: str, name: str) -> dict[str, Any] | None:
+def network_by_name(api: MerakiApi, org_id: str, name: str) -> Optional[Dict[str, Any]]:
     networks = api.get(f"/organizations/{org_id}/networks")
     return next((item for item in networks or [] if item.get("name") == name), None)
 
 
-def onboard_row(api: MerakiApi, org_id: str, row: DeviceRow) -> dict[str, Any]:
+def onboard_row(api: MerakiApi, org_id: str, row: DeviceRow) -> Dict[str, Any]:
     inventory = inventory_device(api, org_id, row.serial)
     if inventory and inventory.get("networkId"):
         raise MerakiApiError(
@@ -87,7 +85,7 @@ def onboard_row(api: MerakiApi, org_id: str, row: DeviceRow) -> dict[str, Any]:
     return {"row": row.row_number, "serial": row.serial, "networkName": row.network_name, "networkId": network_id}
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--org-id", default=os.environ.get("MERAKI_ORG_ID", DEFAULT_ORG_ID))

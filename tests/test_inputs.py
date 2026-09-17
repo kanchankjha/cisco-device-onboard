@@ -8,11 +8,18 @@ from cisco_device_onboard.upgrade_config import _normalize_yaml
 
 
 class InputTests(unittest.TestCase):
+    @staticmethod
+    def remove_temp_file(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
     def write_csv(self, text: str) -> Path:
         handle = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False)
         handle.write(text)
         handle.close()
-        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        self.addCleanup(self.remove_temp_file, Path(handle.name))
         return Path(handle.name)
 
     def test_console_csv_requires_console_columns(self):
