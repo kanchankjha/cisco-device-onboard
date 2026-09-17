@@ -135,6 +135,7 @@ Preview changes:
 ```bash
 dashboard-config \
   --csv devices.csv \
+  --org-id 1234567890123456789 \
   --dry-run
 ```
 
@@ -144,12 +145,13 @@ Apply changes:
 export MERAKI_API_KEY='your-key'
 dashboard-config \
   --csv devices.csv \
+  --org-id 1234567890123456789 \
   --apply \
   --report onboarding-result.json
 ```
 
-Use `MERAKI_ORG_ID`/`--org-id` and `MERAKI_API_BASE_URL`/`--base-url` to
-override the organization or API base URL.
+`--org-id` is required. Use `MERAKI_API_BASE_URL`/`--base-url` to override the
+Dashboard API base URL.
 
 ## Safety
 
