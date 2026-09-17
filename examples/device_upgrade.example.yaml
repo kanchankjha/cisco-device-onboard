@@ -22,3 +22,4 @@ timeouts:
   poll_interval: 15
   prompt: 180
   dhcp: 300
+  wan_dhcp_grace: 60

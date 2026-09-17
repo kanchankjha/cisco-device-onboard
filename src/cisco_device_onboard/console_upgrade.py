@@ -54,6 +54,7 @@ def _known_secrets(config: Dict[str, Any]) -> List[str]:
     return [
         str(connection.get("password", "")),
         str(connection.get("enable_password", "")),
+        _env_or_empty("CONSOLE_FALLBACK_PASSWORD"),
         str(server.get("password", "")),
         str(jump.get("password", "")) if isinstance(jump, dict) else "",
     ]

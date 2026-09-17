@@ -134,6 +134,8 @@ Run the batch:
 export CONSOLE_USERNAME=admin
 export CONSOLE_PASSWORD='console-password'
 export ENABLE_PASSWORD='C1scoOnboard'
+# Required only when an already cloud-managed console needs the fallback login.
+export CONSOLE_FALLBACK_PASSWORD='set-this-in-your-shell'
 
 console-upgrade \
   --csv devices.csv \
@@ -150,6 +152,16 @@ value containing uppercase, lowercase, and a digit. An invalid configured value
 also falls back to this predefined value. To use a different known secret, set
 `ENABLE_PASSWORD` to a 12-character value meeting the same policy.
 
+For an already cloud-managed device, the engine first tries the supplied
+console username/password. If authentication is rejected, it makes one
+fallback attempt with the predefined cloud-management username `miles` and
+the password supplied through `CONSOLE_FALLBACK_PASSWORD`. The fallback
+password is read from the environment and is never stored in the repository.
+For Telnet, the fallback is attempted on the next login challenge; for SSH,
+the engine reconnects with the fallback username. Once Dashboard-enforced
+credentials are active, console access may be unavailable and the run will
+fail with the authentication error.
+
 After entering privileged EXEC mode, the engine runs `no logging console` and
 disables terminal paging so that device logging does not obscure configuration
 and upgrade prompts. The console transcript is streamed to the terminal while
@@ -160,7 +172,7 @@ between attempts. The retry count is recorded in `console_retry_count`.
 
 Run one platform type per batch. Devices with different platform families, console behaviors, image trains, or WAN interface naming should use separate CSV/YAML batches so each run has a single validated upgrade path.
 
-The engine never downgrades a device. If the running version is already at or above `target_version`, image copy/install/reboot is marked `SKIPPED`; WAN DHCP and cloud management are still verified and saved. The appliance must reach the configured SCP/FTP server. Optional CSV columns `console-protocol` and `console-username` override defaults.
+The engine never downgrades a device. If the running version is already at or above `target_version`, image copy/install/reboot is marked `SKIPPED`; WAN DHCP and cloud management are still verified and saved. One or more WAN interfaces may be configured. When multiple interfaces are configured, the engine monitors DHCP assignment for up to `wan_dhcp_grace` seconds (60 by default); if at least one interface gets an address, it continues with the active interface(s) and reports any unassigned interfaces. It fails only when no configured WAN interface gets an address. The appliance must reach the configured SCP/FTP server. Optional CSV columns `console-protocol` and `console-username` override defaults.
 
 ## Dashboard configuration
 

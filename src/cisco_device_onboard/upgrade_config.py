@@ -46,8 +46,8 @@ def load_upgrade_config(path: Path) -> Dict[str, Any]:
     if missing:
         raise UpgradeConfigError("Upgrade YAML is missing: " + ", ".join(missing))
     wans = config.get("wan_interfaces")
-    if not isinstance(wans, list) or len(wans) != 2 or any(not str(item).strip() for item in wans):
-        raise UpgradeConfigError("wan_interfaces must contain exactly two interfaces")
+    if not isinstance(wans, list) or not wans or any(not str(item).strip() for item in wans):
+        raise UpgradeConfigError("wan_interfaces must contain at least one interface")
     config["target_version"] = target_version
     config["wan_interfaces"] = [str(item).strip() for item in wans]
     config.setdefault("image", {}).setdefault("destination", "bootflash:")

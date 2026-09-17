@@ -1,5 +1,6 @@
 import re
 import unittest
+from unittest import mock
 
 from cisco_device_onboard import device_setup_engine
 from cisco_device_onboard.device_setup_engine import ConsoleSession, UpgradeConfigError
@@ -44,6 +45,19 @@ class FakeChild:
 
     def send(self, value):
         self.sent.append(("send", value))
+
+    def close(self, force=False):
+        self.sent.append(("close", force))
+
+
+class FakePexpectSequence(FakePexpect):
+    def __init__(self, children):
+        self.children = list(children)
+
+    def spawn(self, command, args, encoding, timeout):
+        if not self.children:
+            raise AssertionError("No fake console children remain")
+        return self.children.pop(0)
 
 
 def _config(protocol="telnet"):
@@ -120,6 +134,63 @@ class ConsoleConnectionTests(unittest.TestCase):
         self.assertIn(("sendline", "admin"), sent)
         self.assertIn(("sendline", "console-password"), sent)
         self.assertIn(("send", "\r"), sent)
+
+    def test_telnet_retries_with_predefined_cloud_credentials(self):
+        child = FakeChild(
+            [
+                7,
+                6,
+                7,
+                6,
+                (11, "", "Router>"),
+                (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+            ]
+        )
+        previous_pexpect = device_setup_engine.pexpect
+        device_setup_engine.pexpect = FakePexpect(child)
+        self.addCleanup(setattr, device_setup_engine, "pexpect", previous_pexpect)
+
+        with mock.patch.dict(
+            "os.environ", {"CONSOLE_FALLBACK_PASSWORD": "fallback-password"}, clear=False
+        ):
+            ConsoleSession(_config()).connect()
+
+        sent_values = [value for kind, value in child.sent if kind == "sendline"]
+        self.assertEqual(sent_values[:4], ["admin", "console-password", "miles", "fallback-password"])
+
+    def test_ssh_reconnects_with_predefined_username_after_authentication_failure(self):
+        first_child = FakeChild([(14, "Permission denied", "")])
+        second_child = FakeChild(
+            [
+                6,
+                (11, "", "Router>"),
+                (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+            ]
+        )
+        previous_pexpect = device_setup_engine.pexpect
+        device_setup_engine.pexpect = FakePexpectSequence([first_child, second_child])
+        self.addCleanup(setattr, device_setup_engine, "pexpect", previous_pexpect)
+
+        with mock.patch.dict(
+            "os.environ", {"CONSOLE_FALLBACK_PASSWORD": "fallback-password"}, clear=False
+        ):
+            ConsoleSession(_config("ssh")).connect()
+
+        self.assertIn(("sendline", "fallback-password"), second_child.sent)
 
     def test_skips_basic_setup_autoinstall_and_save_dialogs(self):
         sent = self.run_connect(
@@ -256,6 +327,51 @@ class ConsoleConnectionTests(unittest.TestCase):
 
         sent_values = [value for kind, value in child.sent if kind == "sendline"]
         self.assertEqual(sent_values[1], sent_values[2])
+
+    def test_wan_dhcp_continues_with_interface_that_gets_an_address(self):
+        child = FakeChild(
+            [
+                (0, "", "Router(config)#"),
+                (0, "", "Router(config-if)#"),
+                (0, "", "Router(config-if)#"),
+                (0, "", "Router(config-if)#"),
+                (0, "", "Router(config)#"),
+                (0, "", "Router(config-if)#"),
+                (0, "", "Router(config-if)#"),
+                (0, "", "Router(config-if)#"),
+                (0, "", "Router(config)#"),
+                (0, "", "Router#"),
+                (
+                    0,
+                    "Te0/0/8  192.0.2.2  YES DHCP  up  up\n"
+                    "Te0/0/9  unassigned  YES DHCP  administratively down  down\n",
+                    "Router#",
+                ),
+                (0, "ip address dhcp\n", "Router#"),
+                (0, "[OK]\n", "Router#"),
+            ]
+        )
+        session = ConsoleSession(_config())
+        session.child = child
+
+        with mock.patch.object(
+            device_setup_engine.time, "monotonic", side_effect=[0, 1]
+        ):
+            verification = session.configure_wan_dhcp(
+                {
+                    "wan_interfaces": ["Te0/0/8", "Te0/0/9"],
+                    "timeouts": {"wan_dhcp_grace": 0, "poll_interval": 1},
+                }
+            )
+
+        self.assertEqual(verification["active_wan_interfaces"], ["Te0/0/8"])
+        self.assertEqual(verification["unassigned_wan_interfaces"], ["Te0/0/9"])
+        self.assertIn(
+            ("sendline", "show running-config interface Te0/0/8"), child.sent
+        )
+        self.assertNotIn(
+            ("sendline", "show running-config interface Te0/0/9"), child.sent
+        )
 
     def test_repeated_setup_selection_stops_instead_of_sending_ios_command(self):
         child = FakeChild([12, 12])

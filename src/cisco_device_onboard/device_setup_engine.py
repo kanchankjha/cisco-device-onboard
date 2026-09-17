@@ -11,6 +11,7 @@ described by the YAML input.
 import argparse
 import json
 import logging
+import os
 import re
 import shlex
 import string
@@ -38,6 +39,7 @@ DEFAULT_TIMEOUTS = {
     "prompt": 180,
     "reboot": 1800,
     "poll_interval": 15,
+    "wan_dhcp_grace": 60,
 }
 # Require a hostname and the prompt marker at the end of the received text.
 # This avoids matching an echoed command such as ``Router#dir ...`` while also
@@ -45,6 +47,7 @@ DEFAULT_TIMEOUTS = {
 PROMPT_PATTERN = r"(?m)[A-Za-z0-9_.-]+(?:\([^\r\n)]*\))?[>#][ \t]*(?=\r?\n|$)"
 PASSWORD_PATTERN = r"(?i)(?:password|passphrase)\s*:"
 USERNAME_PATTERN = r"(?i)(?:username|login)\s*:"
+AUTH_FAILURE_PATTERN = r"(?i)(?:permission denied|authentication failed|login incorrect|login failed|access denied)"
 RETURN_PATTERN = r"(?i)press\s+(?:return|enter)\s+to\s+get\s+started!?"
 BASIC_SETUP_PATTERN = r"(?i)(?:initial configuration dialog|basic configuration dialog|basic management setup).*?(?:\[yes/no\]|\(yes/no\)|:)"
 AUTOINSTALL_PATTERN = r"(?i)(?:terminate|abort|stop)\s+autoinstall.*?(?:\[yes\]|\[yes/no\]|\(yes/no\)|:)"
@@ -76,6 +79,8 @@ MAX_BOOTSTRAP_SECRET_ATTEMPTS = 3
 BOOTSTRAP_SECRET_LENGTH = 12
 BOOTSTRAP_SECRET_ALPHABET = string.ascii_letters + string.digits
 DEFAULT_BOOTSTRAP_SECRET = "C1scoOnboard"
+DEFAULT_CONSOLE_USERNAME = "miles"
+CONSOLE_FALLBACK_PASSWORD_ENV = "CONSOLE_FALLBACK_PASSWORD"
 MAX_CONSOLE_RETRIES = 3
 CONSOLE_RETRY_INTERVAL = 5
 
@@ -166,8 +171,8 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         raise UpgradeConfigError("'image.source.path' contains an invalid character")
 
     wan_interfaces = config.get("wan_interfaces")
-    if not isinstance(wan_interfaces, list) or len(wan_interfaces) != 2:
-        raise UpgradeConfigError("'wan_interfaces' must contain exactly two interfaces")
+    if not isinstance(wan_interfaces, list) or not wan_interfaces:
+        raise UpgradeConfigError("'wan_interfaces' must contain at least one interface")
     normalized_wans = []
     for index, item in enumerate(wan_interfaces):
         if isinstance(item, str):
@@ -303,6 +308,12 @@ def _interface_has_ip(output: str, interface_name: str) -> bool:
     return False
 
 
+def _authentication_failed(output: str) -> bool:
+    """Return whether console output indicates rejected login credentials."""
+
+    return re.search(AUTH_FAILURE_PATTERN, output or "") is not None
+
+
 class ConsoleSession:
     """Interactive IOS-XE console session backed by the system SSH/Telnet client."""
 
@@ -353,12 +364,43 @@ class ConsoleSession:
             "predefined value"
         )
 
-    def _spawn(self) -> Tuple[str, List[str], List[str]]:
+    @staticmethod
+    def _fallback_console_password() -> str:
+        password = os.environ.get(CONSOLE_FALLBACK_PASSWORD_ENV, "").strip()
+        if not password:
+            raise RuntimeError(
+                "Console authentication failed; set "
+                f"{CONSOLE_FALLBACK_PASSWORD_ENV} to enable the predefined "
+                "cloud-management credential retry"
+            )
+        return password
+
+    def _spawn(
+        self,
+        username_override: Optional[str] = None,
+        password_override: Optional[str] = None,
+    ) -> Tuple[str, List[str], List[str]]:
         protocol = self.config["protocol"]
         host = str(self.connection["ip"])
         port = str(self.connection.get("port", 22 if protocol == "ssh" else 23))
-        username = str(self.connection.get("username", ""))
-        password = str(self.connection.get("password", ""))
+        username = str(
+            self.connection.get("username", "")
+            if username_override is None
+            else username_override
+        )
+        password = str(
+            self.connection.get("password", "")
+            if password_override is None
+            else password_override
+        )
+        console_passwords = [password] if password else []
+        fallback_password = os.environ.get(CONSOLE_FALLBACK_PASSWORD_ENV, "").strip()
+        if (
+            password_override is None
+            and fallback_password
+            and password != fallback_password
+        ):
+            console_passwords.append(fallback_password)
         proxy = self.connection.get("proxy")
         jump_host = self.config.get("jump_host")
         if proxy and not jump_host:
@@ -376,7 +418,7 @@ class ConsoleSession:
                 port,
             ]
             args.extend(shlex.split(str(self.connection.get("ssh_options", ""))))
-            passwords = [password]
+            passwords = list(console_passwords)
             if proxy:
                 jump = _mapping(jump_host, "jump_host")
                 jump_user = str(_required(jump, "username", "jump_host"))
@@ -411,32 +453,47 @@ class ConsoleSession:
             jump_password = str(jump.get("password", ""))
             if jump_password:
                 passwords.append(jump_password)
-            if password:
-                passwords.append(password)
+            passwords.extend(console_passwords)
             return (
                 "ssh",
                 args,
                 passwords,
             )
-        return "telnet", [host, port], [password] if password else []
+        return "telnet", [host, port], console_passwords
 
     def connect(self) -> None:
         if pexpect is None:
             raise RuntimeError(
                 "pexpect is required for console upgrade; install package dependencies first"
             )
-        command, args, self.passwords = self._spawn()
-        LOG.info(
-            "Opening %s console to %s:%s",
-            command,
-            self.connection["ip"],
-            self.connection.get("port", 23 if command == "telnet" else 22),
-        )
-        self.child = pexpect.spawn(command, args, encoding="utf-8", timeout=30)
-        # Stream device output to the operator while retaining pexpect's
-        # captured buffers for prompt matching and error reporting.  pexpect
-        # logs reads only, so passwords sent by the script are not printed.
-        self.child.logfile_read = sys.stdout
+        fallback_username = DEFAULT_CONSOLE_USERNAME
+        supplied_username = str(self.connection.get("username", "")).strip()
+        configured_username = supplied_username
+        fallback_attempted = supplied_username == fallback_username
+
+        def open_console(
+            username_override: Optional[str] = None,
+            password_override: Optional[str] = None,
+        ) -> str:
+            command, args, self.passwords = self._spawn(
+                username_override=username_override,
+                password_override=password_override,
+            )
+            LOG.info(
+                "Opening %s console to %s:%s (username=%s)",
+                command,
+                self.connection["ip"],
+                self.connection.get("port", 23 if command == "telnet" else 22),
+                username_override or supplied_username or "unspecified",
+            )
+            self.child = pexpect.spawn(command, args, encoding="utf-8", timeout=30)
+            # Stream device output to the operator while retaining pexpect's
+            # captured buffers for prompt matching and error reporting.  pexpect
+            # logs reads only, so passwords sent by the script are not printed.
+            self.child.logfile_read = sys.stdout
+            return command
+
+        command = open_console()
         password_index = 0
         wakeup_attempts = 0
         initial_probe = True
@@ -466,10 +523,11 @@ class ConsoleSession:
                     SAVE_CONFIG_PATTERN,
                     pexpect.EOF,
                     pexpect.TIMEOUT,
+                    AUTH_FAILURE_PATTERN,
                 ],
                 timeout=expect_timeout,
             )
-            if index not in (0, 14, 15):
+            if index not in (0, 14, 15, 16):
                 initial_probe = False
             if index == 0:
                 self.child.sendline("yes")
@@ -501,18 +559,24 @@ class ConsoleSession:
                 self._handle_setup_invalid_input()
             elif index == 6:
                 if password_index >= len(self.passwords):
+                    if fallback_attempted:
+                        self._fallback_console_password()
                     raise RuntimeError(
                         "Console requested a password, but no console password was configured"
                     )
                 self.child.sendline(self.passwords[password_index])
                 password_index += 1
             elif index == 7:
-                username = self.connection.get("username")
-                if not username:
+                if configured_username and not fallback_attempted:
+                    self.child.sendline(configured_username)
+                    configured_username = ""
+                elif not fallback_attempted:
+                    self.child.sendline(fallback_username)
+                    fallback_attempted = True
+                else:
                     raise RuntimeError(
-                        "Console requested a username, but no console username was configured"
+                        "Console rejected both the supplied and predefined console usernames"
                     )
-                self.child.sendline(str(username))
             elif index == 8:
                 LOG.info(
                     "Device is ready; pressing Enter to display the console prompt"
@@ -558,6 +622,47 @@ class ConsoleSession:
                     self.config["timeouts"]["prompt"]
                 )
             elif index == 14:
+                failure_text = self.child.before or ""
+                if not fallback_attempted and _authentication_failed(failure_text):
+                    fallback_attempted = True
+                    LOG.warning(
+                        "Console authentication failed for username=%s; retrying "
+                        "with the predefined cloud-management credential username=%s",
+                        supplied_username or "unspecified",
+                        fallback_username,
+                    )
+                    fallback_password = self._fallback_console_password()
+                    self.child.close(force=True)
+                    command = open_console(
+                        username_override=fallback_username,
+                        password_override=fallback_password,
+                    )
+                    password_index = 0
+                    wakeup_attempts = 0
+                    initial_probe = True
+                    post_boot_prompt_deadline = None
+                    continue
+                raise ConsoleDisconnectedError("Console connection closed during login")
+            elif index == 16:
+                if not fallback_attempted:
+                    fallback_attempted = True
+                    LOG.warning(
+                        "Console authentication failed for username=%s; retrying "
+                        "with the predefined cloud-management credential username=%s",
+                        supplied_username or "unspecified",
+                        fallback_username,
+                    )
+                    fallback_password = self._fallback_console_password()
+                    self.child.close(force=True)
+                    command = open_console(
+                        username_override=fallback_username,
+                        password_override=fallback_password,
+                    )
+                    password_index = 0
+                    wakeup_attempts = 0
+                    initial_probe = True
+                    post_boot_prompt_deadline = None
+                    continue
                 raise ConsoleDisconnectedError("Console connection closed during login")
             else:
                 observed = self.child.before or ""
@@ -801,8 +906,8 @@ class ConsoleSession:
                 LOG.info("Install console closed; waiting for the device to return")
                 return output
 
-    def configure_wan_dhcp(self, config: Dict[str, Any]) -> Dict[str, str]:
-        """Enable DHCP on both WAN interfaces and save before upgrading."""
+    def configure_wan_dhcp(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Enable DHCP on configured WAN interfaces and save before upgrading."""
 
         commands = []
         for interface_name in config["wan_interfaces"]:
@@ -819,47 +924,79 @@ class ConsoleSession:
             self.execute(command)
         self.execute("end")
 
-        dhcp_output = self._wait_for_wan_dhcp(config)
-        verification = {"show_ip_interface_brief": dhcp_output}
-        for interface_name in config["wan_interfaces"]:
+        dhcp_output, active_interfaces, missing_interfaces = self._wait_for_wan_dhcp(
+            config
+        )
+        verification: Dict[str, Any] = {
+            "show_ip_interface_brief": dhcp_output,
+            "active_wan_interfaces": active_interfaces,
+            "unassigned_wan_interfaces": missing_interfaces,
+        }
+        for interface_name in active_interfaces:
             output = self.execute(f"show running-config interface {interface_name}")
             if "ip address dhcp" not in output.lower():
                 raise RuntimeError(f"DHCP was not configured on {interface_name}")
             verification[interface_name] = output
         self.execute("write memory")
-        LOG.info("WAN DHCP configuration verified and saved")
+        if missing_interfaces:
+            LOG.warning(
+                "WAN DHCP configuration saved with partial connectivity; active=%s, "
+                "without IP=%s",
+                ", ".join(active_interfaces),
+                ", ".join(missing_interfaces),
+            )
+        else:
+            LOG.info("WAN DHCP configuration verified and saved")
         return verification
 
-    def _wait_for_wan_dhcp(self, config: Dict[str, Any]) -> str:
-        """Wait for both WAN interfaces to receive DHCP addresses."""
+    def _wait_for_wan_dhcp(
+        self, config: Dict[str, Any]
+    ) -> Tuple[str, List[str], List[str]]:
+        """Wait for WAN DHCP, allowing partial success after the grace period."""
 
-        deadline = time.monotonic() + int(config["timeouts"]["dhcp"])
+        grace_period = int(config.get("timeouts", {}).get("wan_dhcp_grace", 60))
+        poll_interval = int(config.get("timeouts", {}).get("poll_interval", 15))
+        deadline = time.monotonic() + grace_period
         last_output = ""
-        while time.monotonic() < deadline:
+        while True:
             last_output = self.execute("show ip int br")
+            active = [
+                interface_name
+                for interface_name in config["wan_interfaces"]
+                if _interface_has_ip(last_output, interface_name)
+            ]
             missing = [
                 interface_name
                 for interface_name in config["wan_interfaces"]
-                if not _interface_has_ip(last_output, interface_name)
+                if interface_name not in active
             ]
             if not missing:
-                LOG.info("Both WAN interfaces acquired DHCP addresses")
-                return last_output
+                LOG.info("All configured WAN interfaces acquired DHCP addresses")
+                return last_output, active, missing
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if active:
+                    LOG.warning(
+                        "Continuing after WAN DHCP grace period with available interfaces: %s",
+                        ", ".join(active),
+                    )
+                    return last_output, active, missing
+                raise TimeoutError(
+                    "No configured WAN interface acquired a DHCP address within "
+                    f"{grace_period} seconds. Last 'show ip int br' output:\n"
+                    f"{last_output}"
+                )
             LOG.info(
-                "Waiting for DHCP address on: %s",
+                "Waiting for WAN DHCP address on: %s (active: %s)",
                 ", ".join(missing),
+                ", ".join(active) if active else "none",
             )
             time.sleep(
                 min(
-                    int(config["timeouts"]["poll_interval"]),
-                    max(0, deadline - time.monotonic()),
+                    poll_interval,
+                    max(0, remaining),
                 )
             )
-        raise TimeoutError(
-            "WAN interfaces did not acquire DHCP addresses within "
-            f"{config['timeouts']['dhcp']} seconds. Last 'show ip int br' output:\n"
-            f"{last_output}"
-        )
 
     def configure_cloud_management(self, config: Dict[str, Any]) -> Dict[str, str]:
         """Enable and verify cloud management after the upgrade reboot."""
