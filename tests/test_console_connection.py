@@ -200,6 +200,34 @@ class ConsoleConnectionTests(unittest.TestCase):
         self.assertTrue(any(character.isdigit() for character in setup_secrets[0]))
         self.assertIn(("sendline", "no logging console"), child.sent)
 
+    def test_initial_setup_replaces_invalid_configured_secret(self):
+        child = FakeChild(
+            [
+                9,
+                1,
+                2,
+                12,
+                (13, "", "Router>"),
+                (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+            ]
+        )
+        self.set_fake_pexpect(child)
+        ConsoleSession(_config()).connect()
+
+        sent_values = [value for kind, value in child.sent if kind == "sendline"]
+        generated = sent_values[1]
+        self.assertEqual(sent_values[1], sent_values[2])
+        self.assertEqual(len(generated), 12)
+        self.assertTrue(any(character.isupper() for character in generated))
+        self.assertTrue(any(character.islower() for character in generated))
+        self.assertTrue(any(character.isdigit() for character in generated))
+
     def test_initial_setup_replaces_generated_secret_after_invalid_input(self):
         config = _config()
         config["device"]["connection"].pop("enable_password")

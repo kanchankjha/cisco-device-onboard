@@ -72,6 +72,7 @@ COPY_FAILURE_MARKERS = (
     "transfer failed",
 )
 MAX_CONSOLE_WAKEUPS = 6
+INITIAL_CONSOLE_PROBE_INTERVAL = 5
 MAX_BOOTSTRAP_SECRET_ATTEMPTS = 3
 BOOTSTRAP_SECRET_LENGTH = 12
 BOOTSTRAP_SECRET_ALPHABET = string.ascii_letters + string.digits
@@ -335,13 +336,15 @@ class ConsoleSession:
         self._bootstrap_invalid_attempts = 0
 
     def _bootstrap_secret_value(self) -> str:
-        if self._configured_enable_password:
-            if not _valid_bootstrap_secret(self._configured_enable_password):
-                raise UpgradeConfigError(
-                    "The configured enable password must be exactly 12 characters "
-                    "with uppercase, lowercase, and a digit for initial setup"
-                )
+        if self._configured_enable_password and _valid_bootstrap_secret(
+            self._configured_enable_password
+        ):
             return self._configured_enable_password
+        if self._configured_enable_password and self._bootstrap_secret is None:
+            LOG.warning(
+                "Configured enable password does not meet the first-boot policy; "
+                "using a generated compliant secret"
+            )
         if self._bootstrap_secret is None:
             self._bootstrap_secret = _generate_bootstrap_secret()
             self._bootstrap_secret_generated = True
@@ -458,9 +461,10 @@ class ConsoleSession:
         self.child.logfile_read = sys.stdout
         password_index = 0
         wakeup_attempts = 0
+        initial_probe = True
         post_boot_prompt_deadline = None
         while True:
-            expect_timeout = 30
+            expect_timeout = INITIAL_CONSOLE_PROBE_INTERVAL if initial_probe else 30
             if post_boot_prompt_deadline is not None:
                 expect_timeout = min(
                     expect_timeout,
@@ -487,6 +491,8 @@ class ConsoleSession:
                 ],
                 timeout=expect_timeout,
             )
+            if index not in (0, 14, 15):
+                initial_probe = False
             if index == 0:
                 self.child.sendline("yes")
             elif index == 1:
@@ -568,7 +574,26 @@ class ConsoleSession:
             elif index == 14:
                 raise ConsoleDisconnectedError("Console connection closed during login")
             else:
-                observed = (self.child.before or "").lower()
+                observed = self.child.before or ""
+                if initial_probe:
+                    if observed.strip():
+                        LOG.info(
+                            "Console data received without a recognized prompt; "
+                            "sending Enter to probe for the IOS prompt"
+                        )
+                    else:
+                        LOG.info(
+                            "No console prompt or message received; sending Enter "
+                            "to probe for the IOS prompt"
+                        )
+                    self.child.send("\r")
+                    wakeup_attempts += 1
+                    if wakeup_attempts >= MAX_CONSOLE_WAKEUPS:
+                        raise ConsoleDisconnectedError(
+                            "Timed out waiting for the console login prompt after "
+                            "initial Enter probes"
+                        )
+                    continue
                 if (
                     post_boot_prompt_deadline is not None
                     and time.monotonic() < post_boot_prompt_deadline
