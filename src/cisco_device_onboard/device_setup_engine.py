@@ -12,7 +12,9 @@ import argparse
 import json
 import logging
 import re
+import secrets
 import shlex
+import string
 import sys
 import time
 from datetime import datetime, timezone
@@ -49,6 +51,11 @@ BASIC_SETUP_PATTERN = r"(?i)(?:initial configuration dialog|basic configuration 
 AUTOINSTALL_PATTERN = r"(?i)(?:terminate|abort|stop)\s+autoinstall.*?(?:\[yes\]|\[yes/no\]|\(yes/no\)|:)"
 SAVE_CONFIG_PATTERN = r"(?i)(?:save|would you like to save).*configuration.*?(?:\[yes/no\]|\(yes/no\)|:)"
 SETUP_SELECTION_PATTERN = r"(?i)enter\s+your\s+selection\s+\[2\]\s*:"
+SETUP_SECRET_PATTERN = r"(?i)enter\s+enable\s+(?:secret|password)\s*:"
+SETUP_SECRET_CONFIRM_PATTERN = r"(?i)confirm\s+enable\s+(?:secret|password)\s*:"
+SETUP_CONSOLE_PASSWORD_PATTERN = r"(?i)enter\s+(?:console|login)\s+password\s*:"
+SETUP_CONSOLE_PASSWORD_CONFIRM_PATTERN = r"(?i)confirm\s+(?:console|login)\s+password\s*:"
+SETUP_INVALID_PATTERN = r"(?i)%\s*invalid\s+input.*?(?:try\s+again|please\s+try)"
 REMOTE_HOST_PATTERN = r"(?i)(?:address|name)\s+of\s+remote\s+host.*?(?:\?|:)"
 SOURCE_FILENAME_PATTERN = r"(?i)(?:source\s+filename|source\s+file\s+name).*?(?:\?|:)"
 COPY_FAILURE_MARKERS = (
@@ -65,10 +72,47 @@ COPY_FAILURE_MARKERS = (
     "transfer failed",
 )
 MAX_CONSOLE_WAKEUPS = 6
+MAX_BOOTSTRAP_SECRET_ATTEMPTS = 3
+BOOTSTRAP_SECRET_LENGTH = 12
+BOOTSTRAP_SECRET_ALPHABET = string.ascii_letters + string.digits
+MAX_CONSOLE_RETRIES = 3
+CONSOLE_RETRY_INTERVAL = 5
+
+
+def _valid_bootstrap_secret(value: str) -> bool:
+    return (
+        len(value) == BOOTSTRAP_SECRET_LENGTH
+        and all(character in BOOTSTRAP_SECRET_ALPHABET for character in value)
+        and any(character.isupper() for character in value)
+        and any(character.islower() for character in value)
+        and any(character.isdigit() for character in value)
+        and "cisco" not in value.lower()
+    )
+
+
+def _generate_bootstrap_secret() -> str:
+    while True:
+        characters = [
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.digits),
+        ]
+        characters.extend(
+            secrets.choice(BOOTSTRAP_SECRET_ALPHABET)
+            for _ in range(BOOTSTRAP_SECRET_LENGTH - len(characters))
+        )
+        secrets.SystemRandom().shuffle(characters)
+        candidate = "".join(characters)
+        if _valid_bootstrap_secret(candidate):
+            return candidate
 
 
 class UpgradeConfigError(ValueError):
     """Raised when the YAML input does not contain a usable configuration."""
+
+
+class ConsoleDisconnectedError(RuntimeError):
+    """Raised when the active console session is lost during an operation."""
 
 
 def _mapping(value: Any, name: str) -> Dict[str, Any]:
@@ -283,6 +327,50 @@ class ConsoleSession:
         self.connection = config["device"]["connection"]
         self.child: Optional[pexpect.spawn] = None
         self.passwords: List[str] = []
+        self._configured_enable_password = str(
+            self.connection.get("enable_password", "")
+        ).strip()
+        self._bootstrap_secret: Optional[str] = None
+        self._bootstrap_secret_generated = False
+        self._bootstrap_invalid_attempts = 0
+
+    def _bootstrap_secret_value(self) -> str:
+        if self._configured_enable_password:
+            if not _valid_bootstrap_secret(self._configured_enable_password):
+                raise UpgradeConfigError(
+                    "The configured enable password must be exactly 12 characters "
+                    "with uppercase, lowercase, and a digit for initial setup"
+                )
+            return self._configured_enable_password
+        if self._bootstrap_secret is None:
+            self._bootstrap_secret = _generate_bootstrap_secret()
+            self._bootstrap_secret_generated = True
+            self.connection["enable_password"] = self._bootstrap_secret
+            LOG.info("Generated a temporary 12-character enable secret for initial setup")
+        return self._bootstrap_secret
+
+    def _send_bootstrap_secret(self) -> None:
+        if self.child is None:
+            raise RuntimeError("Console is not connected")
+        self.child.sendline(self._bootstrap_secret_value())
+
+    def _handle_setup_invalid_input(self) -> None:
+        self._bootstrap_invalid_attempts += 1
+        if not self._bootstrap_secret_generated:
+            raise RuntimeError(
+                "Initial setup rejected the configured enable secret; "
+                "provide a valid 12-character value"
+            )
+        if self._bootstrap_invalid_attempts >= MAX_BOOTSTRAP_SECRET_ATTEMPTS:
+            raise RuntimeError(
+                "Initial setup rejected the generated enable secret after "
+                f"{MAX_BOOTSTRAP_SECRET_ATTEMPTS} attempts"
+            )
+        self._bootstrap_secret = None
+        self.connection.pop("enable_password", None)
+        LOG.warning(
+            "Initial setup rejected the generated enable secret; generating a replacement"
+        )
 
     def _spawn(self) -> Tuple[str, List[str], List[str]]:
         protocol = self.config["protocol"]
@@ -381,14 +469,19 @@ class ConsoleSession:
             index = self.child.expect(
                 [
                     r"(?i)are you sure you want to continue connecting.*",
+                    SETUP_SECRET_PATTERN,
+                    SETUP_SECRET_CONFIRM_PATTERN,
+                    SETUP_CONSOLE_PASSWORD_PATTERN,
+                    SETUP_CONSOLE_PASSWORD_CONFIRM_PATTERN,
+                    SETUP_INVALID_PATTERN,
                     PASSWORD_PATTERN,
                     USERNAME_PATTERN,
                     RETURN_PATTERN,
                     BASIC_SETUP_PATTERN,
                     AUTOINSTALL_PATTERN,
                     SAVE_CONFIG_PATTERN,
-                    SETUP_SELECTION_PATTERN,
                     PROMPT_PATTERN,
+                    SETUP_SELECTION_PATTERN,
                     pexpect.EOF,
                     pexpect.TIMEOUT,
                 ],
@@ -397,20 +490,46 @@ class ConsoleSession:
             if index == 0:
                 self.child.sendline("yes")
             elif index == 1:
+                LOG.info("Supplying the initial setup enable secret")
+                self._send_bootstrap_secret()
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 2:
+                LOG.info("Confirming the initial setup enable secret")
+                self._send_bootstrap_secret()
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 3:
+                LOG.info("Supplying the initial setup console password")
+                self._send_bootstrap_secret()
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 4:
+                LOG.info("Confirming the initial setup console password")
+                self._send_bootstrap_secret()
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 5:
+                self._handle_setup_invalid_input()
+            elif index == 6:
                 if password_index >= len(self.passwords):
                     raise RuntimeError(
                         "Console requested a password, but no console password was configured"
                     )
                 self.child.sendline(self.passwords[password_index])
                 password_index += 1
-            elif index == 2:
+            elif index == 7:
                 username = self.connection.get("username")
                 if not username:
                     raise RuntimeError(
                         "Console requested a username, but no console username was configured"
                     )
                 self.child.sendline(str(username))
-            elif index == 3:
+            elif index == 8:
                 LOG.info(
                     "Device is ready; pressing Enter to display the console prompt"
                 )
@@ -418,36 +537,36 @@ class ConsoleSession:
                 post_boot_prompt_deadline = time.monotonic() + int(
                     self.config["timeouts"]["prompt"]
                 )
-            elif index == 4:
+            elif index == 9:
                 LOG.info("Skipping basic setup dialog")
                 self.child.sendline("no")
                 post_boot_prompt_deadline = time.monotonic() + int(
                     self.config["timeouts"]["prompt"]
                 )
-            elif index == 5:
+            elif index == 10:
                 LOG.info("Terminating autoinstall dialog")
                 self.child.sendline("yes")
                 post_boot_prompt_deadline = time.monotonic() + int(
                     self.config["timeouts"]["prompt"]
                 )
-            elif index == 6:
+            elif index == 11:
                 LOG.info("Declining setup configuration save prompt")
                 self.child.sendline("no")
                 post_boot_prompt_deadline = time.monotonic() + int(
                     self.config["timeouts"]["prompt"]
                 )
-            elif index == 7:
+            elif index == 12:
                 LOG.info("Going to the IOS prompt without saving setup configuration")
                 self.child.sendline("0")
                 post_boot_prompt_deadline = time.monotonic() + int(
                     self.config["timeouts"]["prompt"]
                 )
-            elif index == 8:
+            elif index == 13:
                 LOG.debug("Console prompt detected")
                 self._prepare_terminal()
                 return
-            elif index == 9:
-                raise RuntimeError("Console connection closed during login")
+            elif index == 14:
+                raise ConsoleDisconnectedError("Console connection closed during login")
             else:
                 observed = (self.child.before or "").lower()
                 if (
@@ -462,13 +581,16 @@ class ConsoleSession:
                     LOG.debug("Console is quiet; sending wake-up Enter")
                     self.child.send("\r")
                     continue
-                raise TimeoutError(
+                raise ConsoleDisconnectedError(
                     "Timed out waiting for the console login prompt after wake-up attempts"
                 )
 
     def _prepare_terminal(self) -> None:
         self._reset_to_exec_prompt()
         self._enter_privileged_mode()
+        self.execute("configure terminal")
+        self.execute("no logging console")
+        self.execute("end")
         self.execute("terminal length 0")
         self.execute("terminal width 0")
 
@@ -479,8 +601,17 @@ class ConsoleSession:
         try:
             self.child.expect(PROMPT_PATTERN, timeout=10)
         except pexpect.TIMEOUT:
-            self.child.send("\r")
-            self.child.expect(PROMPT_PATTERN, timeout=10)
+            try:
+                self.child.send("\r")
+                self.child.expect(PROMPT_PATTERN, timeout=10)
+            except (pexpect.EOF, pexpect.TIMEOUT, OSError) as exc:
+                raise ConsoleDisconnectedError(
+                    "Console disconnected while returning to the IOS prompt"
+                ) from exc
+        except (pexpect.EOF, OSError) as exc:
+            raise ConsoleDisconnectedError(
+                "Console disconnected while returning to the IOS prompt"
+            ) from exc
 
     def _enter_privileged_mode(self) -> None:
         if self.child is None:
@@ -505,15 +636,23 @@ class ConsoleSession:
                     "Unable to enter privileged EXEC mode; console remains at Router>"
                 )
         elif index == 2:
-            raise RuntimeError("Console closed while entering privileged EXEC mode")
+            raise ConsoleDisconnectedError(
+                "Console closed while entering privileged EXEC mode"
+            )
         else:
-            raise TimeoutError("Timed out entering privileged EXEC mode")
+            raise ConsoleDisconnectedError("Timed out entering privileged EXEC mode")
 
     def execute(self, command: str, timeout: int = 120) -> str:
         if self.child is None:
             raise RuntimeError("Console is not connected")
-        self.child.sendline(command)
-        self.child.expect(PROMPT_PATTERN, timeout=timeout)
+        LOG.info("Running device command: %s", command)
+        try:
+            self.child.sendline(command)
+            self.child.expect(PROMPT_PATTERN, timeout=timeout)
+        except (pexpect.EOF, pexpect.TIMEOUT, OSError) as exc:
+            raise ConsoleDisconnectedError(
+                f"Console disconnected while running device command: {command}"
+            ) from exc
         return self.child.before or ""
 
     def copy_image(self, config: Dict[str, Any], image_name: str) -> str:
@@ -599,7 +738,9 @@ class ConsoleSession:
                 LOG.info("%s copy completed and image verified: %s", transfer_protocol.upper(), image_name)
                 return verification
             elif index == 8:
-                raise RuntimeError(f"Console closed during {transfer_protocol.upper()} copy: {output}")
+                raise ConsoleDisconnectedError(
+                    f"Console closed during {transfer_protocol.upper()} copy: {output}"
+                )
             else:
                 raise TimeoutError(f"Timed out during {transfer_protocol.upper()} copy: {output}")
 
@@ -775,6 +916,57 @@ def _wait_for_image(
     )
 
 
+def _is_console_disconnect(error: Exception) -> bool:
+    if isinstance(error, (ConsoleDisconnectedError, ConnectionError)):
+        return True
+    return pexpect is not None and isinstance(error, (pexpect.EOF, pexpect.TIMEOUT))
+
+
+def _run_upgrade_once(
+    config: Dict[str, Any], session: ConsoleSession, report: Dict[str, Any]
+) -> Dict[str, Any]:
+    image_name = report["target_image"]
+    try:
+        LOG.info("STEP 1/7: Connect to the device console and complete first-boot setup")
+        session.connect()
+        LOG.info("STEP 2/7: Read the current IOS-XE version")
+        before_show_version = session.execute("show version")
+        report["before_show_version"] = before_show_version
+        running_version = _running_version(before_show_version)
+        report["running_version"] = running_version
+        LOG.info("STEP 3/7: Configure and verify DHCP on both WAN interfaces")
+        report["pre_upgrade_wan_dhcp"] = session.configure_wan_dhcp(config)
+        if _version_at_least(running_version, config["target_version"]):
+            LOG.info("STEP 4/7: Skip image copy/install because the target is already active")
+            report["upgrade_status"] = "SKIPPED"
+            report["upgrade_reason"] = (
+                f"Running IOS-XE version {running_version} is already at or above "
+                f"target {config['target_version']}"
+            )
+            report["after_show_version"] = before_show_version
+        else:
+            report["upgrade_status"] = "PERFORMED"
+            LOG.info("STEP 4/7: Copy the target IOS-XE image to the device")
+            session.copy_image(config, image_name)
+            LOG.info("STEP 5/7: Activate, commit, and reboot into the target image")
+            report["install_output"] = session.install_image(config, image_name)
+            LOG.info("STEP 6/7: Wait for reboot and verify the active IOS-XE image")
+            report["after_show_version"] = _wait_for_image(config, image_name, session)
+        if _version_at_least(running_version, config["target_version"]):
+            LOG.info("STEP 6/7: Verify the already-active IOS-XE image")
+        LOG.info("STEP 7/7: Configure, verify, and save cloud management")
+        report["cloud_management"] = session.configure_cloud_management(config)
+        report["result"] = "PASSED"
+        return report
+    except Exception as exc:
+        if _is_console_disconnect(exc):
+            raise
+        report["error"] = str(exc)
+        return report
+    finally:
+        session.close()
+
+
 def run_upgrade(config: Dict[str, Any]) -> Dict[str, Any]:
     image_name = _image_name(config)
     session = ConsoleSession(config)
@@ -786,35 +978,35 @@ def run_upgrade(config: Dict[str, Any]) -> Dict[str, Any]:
         "target_version": config["target_version"],
         "wan_interfaces": config["wan_interfaces"],
         "upgrade_status": "NOT_STARTED",
+        "console_retry_count": 0,
         "result": "FAILED",
     }
-    try:
-        session.connect()
-        before_show_version = session.execute("show version")
-        report["before_show_version"] = before_show_version
-        running_version = _running_version(before_show_version)
-        report["running_version"] = running_version
-        report["pre_upgrade_wan_dhcp"] = session.configure_wan_dhcp(config)
-        if _version_at_least(running_version, config["target_version"]):
-            report["upgrade_status"] = "SKIPPED"
-            report["upgrade_reason"] = (
-                f"Running IOS-XE version {running_version} is already at or above "
-                f"target {config['target_version']}"
+    while True:
+        try:
+            return _run_upgrade_once(config, session, report)
+        except Exception as exc:
+            if not _is_console_disconnect(exc):
+                report["error"] = str(exc)
+                return report
+            retry_count = int(report["console_retry_count"]) + 1
+            if retry_count > MAX_CONSOLE_RETRIES:
+                report["console_retry_count"] = MAX_CONSOLE_RETRIES
+                report["error"] = str(exc)
+                LOG.error(
+                    "Console disconnected; exhausted %d retries: %s",
+                    MAX_CONSOLE_RETRIES,
+                    exc,
+                )
+                return report
+            report["console_retry_count"] = retry_count
+            LOG.warning(
+                "Console disconnected during the upgrade; retry %d/%d in %d seconds: %s",
+                retry_count,
+                MAX_CONSOLE_RETRIES,
+                CONSOLE_RETRY_INTERVAL,
+                exc,
             )
-            report["after_show_version"] = before_show_version
-        else:
-            report["upgrade_status"] = "PERFORMED"
-            session.copy_image(config, image_name)
-            report["install_output"] = session.install_image(config, image_name)
-            report["after_show_version"] = _wait_for_image(config, image_name, session)
-        report["cloud_management"] = session.configure_cloud_management(config)
-        report["result"] = "PASSED"
-        return report
-    except Exception as exc:
-        report["error"] = str(exc)
-        return report
-    finally:
-        session.close()
+            time.sleep(CONSOLE_RETRY_INTERVAL)
 
 
 def _redacted_summary(config: Dict[str, Any]) -> Dict[str, Any]:

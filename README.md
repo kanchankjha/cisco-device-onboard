@@ -133,13 +133,30 @@ Run the batch:
 ```bash
 export CONSOLE_USERNAME=admin
 export CONSOLE_PASSWORD='console-password'
-export ENABLE_PASSWORD='enable-password'
+export ENABLE_PASSWORD='C1scoOnboard'
 
 console-upgrade \
   --csv devices.csv \
   --config device_upgrade.yaml \
   --report-dir upgrade-reports
 ```
+
+On a first-boot IOS-XE console, the engine answers the initial setup dialog,
+supplies the enable secret and console/login password, selects option `0` to
+leave setup without saving its generated setup configuration, and then waits
+for the IOS prompt. `ENABLE_PASSWORD` is optional for this first-boot path. If
+it is omitted, a temporary 12-character value containing uppercase, lowercase,
+and a digit is generated and reused for the session. For repeatable access
+after the run, set `ENABLE_PASSWORD` to a 12-character value meeting the same
+policy. The generated value is never printed or written to the report.
+
+After entering privileged EXEC mode, the engine runs `no logging console` and
+disables terminal paging so that device logging does not obscure configuration
+and upgrade prompts. The console transcript is streamed to the terminal while
+each device is running; the JSON report remains the machine-readable result.
+If the console disconnects during an upgrade step, the same session state is
+reconnected and the workflow is retried up to three times, waiting five seconds
+between attempts. The retry count is recorded in `console_retry_count`.
 
 Run one platform type per batch. Devices with different platform families, console behaviors, image trains, or WAN interface naming should use separate CSV/YAML batches so each run has a single validated upgrade path.
 

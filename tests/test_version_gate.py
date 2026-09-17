@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from cisco_device_onboard.device_setup_engine import (
+    ConsoleDisconnectedError,
     _running_version,
     _version_at_least,
     run_upgrade,
@@ -69,6 +70,46 @@ class VersionGateTests(unittest.TestCase):
         self.assertEqual(report["result"], "PASSED")
         self.assertEqual(report["upgrade_status"], "SKIPPED")
         self.assertNotIn("install_output", report)
+
+    def test_run_upgrade_retries_console_disconnect_three_times_at_five_seconds(self):
+        config = {
+            "device": {"name": "router", "connection": {}},
+            "protocol": "telnet",
+            "target_version": "26.2",
+            "wan_interfaces": ["Te0/0/8", "Te0/0/9"],
+            "image": {
+                "destination": "bootflash:",
+                "source": {
+                    "path": "/images/cat9k.bin",
+                    "protocol": "scp",
+                    "server": {"ip": "192.0.2.20", "username": "image-user", "password": "image-password"},
+                },
+            },
+        }
+        session = mock.Mock()
+        session.connect.side_effect = [
+            ConsoleDisconnectedError("link dropped"),
+            ConsoleDisconnectedError("link dropped"),
+            None,
+        ]
+        session.execute.return_value = "Cisco IOS XE Software, Version 26.2.1"
+        session.configure_wan_dhcp.return_value = {
+            "show_ip_interface_brief": "Te0/0/8 192.0.2.2 up up"
+        }
+        session.configure_cloud_management.return_value = {
+            "service_cloud_mgmt": "service cloud-mgmt connect"
+        }
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.ConsoleSession",
+            return_value=session,
+        ), mock.patch("cisco_device_onboard.device_setup_engine.time.sleep") as sleep:
+            report = run_upgrade(config)
+
+        self.assertEqual(report["result"], "PASSED")
+        self.assertEqual(report["console_retry_count"], 2)
+        self.assertEqual(session.connect.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(5)])
 
 
 if __name__ == "__main__":

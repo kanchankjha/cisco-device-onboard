@@ -17,6 +17,18 @@ from .upgrade_config import UpgradeConfigError, load_upgrade_config
 ENGINE_PATH = Path(__file__).with_name("device_setup_engine.py")
 
 
+def _display_value(value: Any, fallback: str = "-") -> str:
+    text = str(value).strip() if value is not None else ""
+    return text.replace("\r", " ").replace("\n", " ") or fallback
+
+
+def _row_prefix(row: DeviceRow) -> str:
+    return (
+        f"[device={_display_value(row.serial)} "
+        f"network={_display_value(row.network_name)}]"
+    )
+
+
 def _env_or_empty(name: str) -> str:
     return os.environ.get(name, "").strip()
 
@@ -90,20 +102,44 @@ def redacted_plan(rows: List[DeviceRow], config: Dict[str, Any]) -> Dict[str, An
 
 def upgrade_row(row: DeviceRow, config: Dict[str, Any], report_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     report_dir.mkdir(parents=True, exist_ok=True)
+    prefix = _row_prefix(row)
+    print(f"\n{prefix} START console upgrade (CSV row {row.row_number})", flush=True)
+    print(
+        f"{prefix} target={_display_value(config.get('target_version'))} "
+        f"image={_display_value(config.get('image', {}).get('source', {}).get('path'))}",
+        flush=True,
+    )
     with tempfile.TemporaryDirectory(prefix=f"cisco-device-{row.serial}-") as temp_dir:
         temp_path = Path(temp_dir)
         config_path = temp_path / "device_upgrade.yaml"
         report_path = temp_path / "upgrade-result.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         os.chmod(config_path, 0o600)
-        command = [sys.executable, str(ENGINE_PATH), str(config_path), "--report", str(report_path)]
-        completed = subprocess.run(
+        command = [
+            sys.executable,
+            "-u",
+            str(ENGINE_PATH),
+            str(config_path),
+            "--report",
+            str(report_path),
+        ]
+        completed = subprocess.Popen(
             command,
             cwd=ENGINE_PATH.parent,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             universal_newlines=True,
+            bufsize=1,
         )
+        console_output = []
+        if completed.stdout is not None:
+            for line in iter(completed.stdout.readline, ""):
+                text = line.rstrip("\r\n")
+                print(f"{prefix} {text}" if text else prefix, flush=True)
+                console_output.append(line)
+            completed.stdout.close()
+        return_code = completed.wait()
+        console_log = "".join(console_output)
         result: Dict[str, Any] = {"serial": row.serial, "row": row.row_number}
         secrets = _known_secrets(config)
         if report_path.is_file():
@@ -111,11 +147,11 @@ def upgrade_row(row: DeviceRow, config: Dict[str, Any], report_dir: Path, args: 
                 result.update(_redact(json.loads(report_path.read_text(encoding="utf-8")), secrets))
             except (OSError, json.JSONDecodeError):
                 pass
-        if completed.returncode == 0:
+        if return_code == 0:
             result.setdefault("result", "PASSED")
         else:
             result["result"] = "FAILED"
-            error_text = (completed.stderr or completed.stdout or "Console upgrade failed").strip()
+            error_text = (console_log or "Console upgrade failed").strip()
             result["error"] = _redact(
                 error_text.splitlines()[-1] if error_text else "Console upgrade failed",
                 secrets,
@@ -124,6 +160,11 @@ def upgrade_row(row: DeviceRow, config: Dict[str, Any], report_dir: Path, args: 
         output_path = report_dir / f"{row.serial}.json"
         output_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
         os.chmod(output_path, 0o600)
+        print(
+            f"{prefix} END result={result.get('result', 'FAILED')} "
+            f"report={output_path}",
+            flush=True,
+        )
         return result
 
 

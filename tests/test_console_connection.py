@@ -1,3 +1,4 @@
+import re
 import unittest
 
 from cisco_device_onboard import device_setup_engine
@@ -103,11 +104,14 @@ class ConsoleConnectionTests(unittest.TestCase):
     def test_username_password_return_and_prompt(self):
         sent = self.run_connect(
             [
-                2,
-                1,
-                3,
-                (8, "", "Router>"),
+                7,
+                6,
+                8,
+                (13, "", "Router>"),
                 (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -120,12 +124,15 @@ class ConsoleConnectionTests(unittest.TestCase):
     def test_skips_basic_setup_autoinstall_and_save_dialogs(self):
         sent = self.run_connect(
             [
-                4,
-                5,
-                6,
-                7,
-                (8, "", "Router>"),
+                9,
+                10,
+                11,
+                12,
+                (13, "", "Router>"),
                 (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -144,9 +151,12 @@ class ConsoleConnectionTests(unittest.TestCase):
     def test_quiet_ssh_console_gets_wakeup_enter(self):
         sent = self.run_connect(
             [
-                10,
-                (8, "", "Router>"),
+                15,
+                (13, "", "Router>"),
                 (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -154,6 +164,85 @@ class ConsoleConnectionTests(unittest.TestCase):
             protocol="ssh",
         )
         self.assertIn(("send", "\r"), sent)
+
+    def test_initial_setup_generates_and_confirms_bootstrap_secret(self):
+        config = _config()
+        config["device"]["connection"].pop("enable_password")
+        child = FakeChild(
+            [
+                9,
+                1,
+                2,
+                3,
+                4,
+                12,
+                (13, "", "Router>"),
+                (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+            ]
+        )
+        self.set_fake_pexpect(child)
+        ConsoleSession(config).connect()
+
+        sent_values = [value for kind, value in child.sent if kind == "sendline"]
+        setup_secrets = sent_values[1:5]
+        self.assertEqual(setup_secrets[0], setup_secrets[1])
+        self.assertEqual(setup_secrets[0], setup_secrets[2])
+        self.assertEqual(setup_secrets[2], setup_secrets[3])
+        self.assertEqual(len(setup_secrets[0]), 12)
+        self.assertTrue(any(character.isupper() for character in setup_secrets[0]))
+        self.assertTrue(any(character.islower() for character in setup_secrets[0]))
+        self.assertTrue(any(character.isdigit() for character in setup_secrets[0]))
+        self.assertIn(("sendline", "no logging console"), child.sent)
+
+    def test_initial_setup_replaces_generated_secret_after_invalid_input(self):
+        config = _config()
+        config["device"]["connection"].pop("enable_password")
+        child = FakeChild(
+            [
+                9,
+                1,
+                5,
+                1,
+                2,
+                12,
+                (13, "", "Router>"),
+                (0, "", "Router>"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+                (1, "", "Router#"),
+            ]
+        )
+        self.set_fake_pexpect(child)
+        ConsoleSession(config).connect()
+
+        sent_values = [value for kind, value in child.sent if kind == "sendline"]
+        self.assertNotEqual(sent_values[1], sent_values[2])
+
+    def test_first_boot_transcript_prompts_match_expected_patterns(self):
+        self.assertIsNotNone(
+            re.search(device_setup_engine.SETUP_SECRET_PATTERN, "Enter enable secret:")
+        )
+        self.assertIsNotNone(
+            re.search(
+                device_setup_engine.SETUP_SECRET_CONFIRM_PATTERN,
+                "Confirm enable secret:",
+            )
+        )
+        self.assertIsNotNone(
+            re.search(
+                device_setup_engine.SETUP_INVALID_PATTERN,
+                "% Invalid input.Please try again",
+            )
+        )
 
     def test_copy_image_uses_scp_url_and_verifies_image(self):
         child = FakeChild(
