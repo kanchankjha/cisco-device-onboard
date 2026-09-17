@@ -145,10 +145,10 @@ On a first-boot IOS-XE console, the engine answers the initial setup dialog,
 supplies the enable secret and console/login password, selects option `0` to
 leave setup without saving its generated setup configuration, and then waits
 for the IOS prompt. `ENABLE_PASSWORD` is optional for this first-boot path. If
-it is omitted, a temporary 12-character value containing uppercase, lowercase,
-and a digit is generated and reused for the session. For repeatable access
-after the run, set `ENABLE_PASSWORD` to a 12-character value meeting the same
-policy. The generated value is never printed or written to the report.
+it is omitted, the predefined `C1scoOnboard` value is used. This is a 12-character
+value containing uppercase, lowercase, and a digit. An invalid configured value
+also falls back to this predefined value. To use a different known secret, set
+`ENABLE_PASSWORD` to a 12-character value meeting the same policy.
 
 After entering privileged EXEC mode, the engine runs `no logging console` and
 disables terminal paging so that device logging does not obscure configuration

@@ -12,7 +12,6 @@ import argparse
 import json
 import logging
 import re
-import secrets
 import shlex
 import string
 import sys
@@ -49,7 +48,7 @@ USERNAME_PATTERN = r"(?i)(?:username|login)\s*:"
 RETURN_PATTERN = r"(?i)press\s+(?:return|enter)\s+to\s+get\s+started!?"
 BASIC_SETUP_PATTERN = r"(?i)(?:initial configuration dialog|basic configuration dialog|basic management setup).*?(?:\[yes/no\]|\(yes/no\)|:)"
 AUTOINSTALL_PATTERN = r"(?i)(?:terminate|abort|stop)\s+autoinstall.*?(?:\[yes\]|\[yes/no\]|\(yes/no\)|:)"
-SAVE_CONFIG_PATTERN = r"(?i)(?:save|would you like to save).*configuration.*?(?:\[yes/no\]|\(yes/no\)|:)"
+SAVE_CONFIG_PATTERN = r"(?i)(?:would you like to save|save this configuration).*?(?:\[yes/no\]|\(yes/no\))\s*:"
 SETUP_SELECTION_PATTERN = r"(?i)enter\s+your\s+selection\s+\[2\]\s*:"
 SETUP_SECRET_PATTERN = r"(?i)enter\s+enable\s+(?:secret|password)\s*:"
 SETUP_SECRET_CONFIRM_PATTERN = r"(?i)confirm\s+enable\s+(?:secret|password)\s*:"
@@ -76,6 +75,7 @@ INITIAL_CONSOLE_PROBE_INTERVAL = 5
 MAX_BOOTSTRAP_SECRET_ATTEMPTS = 3
 BOOTSTRAP_SECRET_LENGTH = 12
 BOOTSTRAP_SECRET_ALPHABET = string.ascii_letters + string.digits
+DEFAULT_BOOTSTRAP_SECRET = "C1scoOnboard"
 MAX_CONSOLE_RETRIES = 3
 CONSOLE_RETRY_INTERVAL = 5
 
@@ -89,23 +89,6 @@ def _valid_bootstrap_secret(value: str) -> bool:
         and any(character.isdigit() for character in value)
         and "cisco" not in value.lower()
     )
-
-
-def _generate_bootstrap_secret() -> str:
-    while True:
-        characters = [
-            secrets.choice(string.ascii_uppercase),
-            secrets.choice(string.ascii_lowercase),
-            secrets.choice(string.digits),
-        ]
-        characters.extend(
-            secrets.choice(BOOTSTRAP_SECRET_ALPHABET)
-            for _ in range(BOOTSTRAP_SECRET_LENGTH - len(characters))
-        )
-        secrets.SystemRandom().shuffle(characters)
-        candidate = "".join(characters)
-        if _valid_bootstrap_secret(candidate):
-            return candidate
 
 
 class UpgradeConfigError(ValueError):
@@ -332,8 +315,8 @@ class ConsoleSession:
             self.connection.get("enable_password", "")
         ).strip()
         self._bootstrap_secret: Optional[str] = None
-        self._bootstrap_secret_generated = False
         self._bootstrap_invalid_attempts = 0
+        self._setup_selection_sent = False
 
     def _bootstrap_secret_value(self) -> str:
         if self._configured_enable_password and _valid_bootstrap_secret(
@@ -343,13 +326,12 @@ class ConsoleSession:
         if self._configured_enable_password and self._bootstrap_secret is None:
             LOG.warning(
                 "Configured enable password does not meet the first-boot policy; "
-                "using a generated compliant secret"
+                "using the predefined compliant bootstrap secret"
             )
         if self._bootstrap_secret is None:
-            self._bootstrap_secret = _generate_bootstrap_secret()
-            self._bootstrap_secret_generated = True
+            self._bootstrap_secret = DEFAULT_BOOTSTRAP_SECRET
             self.connection["enable_password"] = self._bootstrap_secret
-            LOG.info("Generated a temporary 12-character enable secret for initial setup")
+            LOG.info("Using the predefined 12-character enable secret for initial setup")
         return self._bootstrap_secret
 
     def _send_bootstrap_secret(self) -> None:
@@ -359,20 +341,16 @@ class ConsoleSession:
 
     def _handle_setup_invalid_input(self) -> None:
         self._bootstrap_invalid_attempts += 1
-        if not self._bootstrap_secret_generated:
-            raise RuntimeError(
-                "Initial setup rejected the configured enable secret; "
-                "provide a valid 12-character value"
-            )
         if self._bootstrap_invalid_attempts >= MAX_BOOTSTRAP_SECRET_ATTEMPTS:
             raise RuntimeError(
-                "Initial setup rejected the generated enable secret after "
+                "Initial setup rejected the bootstrap enable secret after "
                 f"{MAX_BOOTSTRAP_SECRET_ATTEMPTS} attempts"
             )
         self._bootstrap_secret = None
         self.connection.pop("enable_password", None)
         LOG.warning(
-            "Initial setup rejected the generated enable secret; generating a replacement"
+            "Initial setup rejected the bootstrap enable secret; retrying with the "
+            "predefined value"
         )
 
     def _spawn(self) -> Tuple[str, List[str], List[str]]:
@@ -483,9 +461,9 @@ class ConsoleSession:
                     RETURN_PATTERN,
                     BASIC_SETUP_PATTERN,
                     AUTOINSTALL_PATTERN,
-                    SAVE_CONFIG_PATTERN,
                     PROMPT_PATTERN,
                     SETUP_SELECTION_PATTERN,
+                    SAVE_CONFIG_PATTERN,
                     pexpect.EOF,
                     pexpect.TIMEOUT,
                 ],
@@ -556,21 +534,29 @@ class ConsoleSession:
                     self.config["timeouts"]["prompt"]
                 )
             elif index == 11:
+                LOG.debug("Console prompt detected")
+                self._prepare_terminal()
+                return
+            elif index == 12:
+                LOG.info("Selecting IOS command prompt without saving setup configuration")
+                if self._setup_selection_sent:
+                    raise RuntimeError(
+                        "Setup selection prompt reappeared after sending 0; "
+                        "stopping to avoid sending 0 at the IOS command prompt"
+                    )
+                self._setup_selection_sent = True
+                self.child.sendline("0")
+                LOG.debug("Probing the console after submitting setup selection 0")
+                self.child.send("\r")
+                post_boot_prompt_deadline = time.monotonic() + int(
+                    self.config["timeouts"]["prompt"]
+                )
+            elif index == 13:
                 LOG.info("Declining setup configuration save prompt")
                 self.child.sendline("no")
                 post_boot_prompt_deadline = time.monotonic() + int(
                     self.config["timeouts"]["prompt"]
                 )
-            elif index == 12:
-                LOG.info("Going to the IOS prompt without saving setup configuration")
-                self.child.sendline("0")
-                post_boot_prompt_deadline = time.monotonic() + int(
-                    self.config["timeouts"]["prompt"]
-                )
-            elif index == 13:
-                LOG.debug("Console prompt detected")
-                self._prepare_terminal()
-                return
             elif index == 14:
                 raise ConsoleDisconnectedError("Console connection closed during login")
             else:

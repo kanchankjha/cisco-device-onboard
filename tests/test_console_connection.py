@@ -107,7 +107,7 @@ class ConsoleConnectionTests(unittest.TestCase):
                 7,
                 6,
                 8,
-                (13, "", "Router>"),
+                (11, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -126,9 +126,9 @@ class ConsoleConnectionTests(unittest.TestCase):
             [
                 9,
                 10,
-                11,
+                13,
                 12,
-                (13, "", "Router>"),
+                (11, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -147,12 +147,13 @@ class ConsoleConnectionTests(unittest.TestCase):
             ],
             [item for item in sent if item[0] == "sendline"][:4],
         )
+        self.assertIn(("send", "\r"), sent)
 
     def test_quiet_ssh_console_gets_wakeup_enter(self):
         sent = self.run_connect(
             [
                 15,
-                (13, "", "Router>"),
+                (11, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -176,7 +177,7 @@ class ConsoleConnectionTests(unittest.TestCase):
                 3,
                 4,
                 12,
-                (13, "", "Router>"),
+                (11, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -207,7 +208,7 @@ class ConsoleConnectionTests(unittest.TestCase):
                 1,
                 2,
                 12,
-                (13, "", "Router>"),
+                (11, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -223,6 +224,7 @@ class ConsoleConnectionTests(unittest.TestCase):
         sent_values = [value for kind, value in child.sent if kind == "sendline"]
         generated = sent_values[1]
         self.assertEqual(sent_values[1], sent_values[2])
+        self.assertEqual(generated, device_setup_engine.DEFAULT_BOOTSTRAP_SECRET)
         self.assertEqual(len(generated), 12)
         self.assertTrue(any(character.isupper() for character in generated))
         self.assertTrue(any(character.islower() for character in generated))
@@ -239,7 +241,7 @@ class ConsoleConnectionTests(unittest.TestCase):
                 1,
                 2,
                 12,
-                (13, "", "Router>"),
+                (11, "", "Router>"),
                 (0, "", "Router>"),
                 (1, "", "Router#"),
                 (1, "", "Router#"),
@@ -253,7 +255,19 @@ class ConsoleConnectionTests(unittest.TestCase):
         ConsoleSession(config).connect()
 
         sent_values = [value for kind, value in child.sent if kind == "sendline"]
-        self.assertNotEqual(sent_values[1], sent_values[2])
+        self.assertEqual(sent_values[1], sent_values[2])
+
+    def test_repeated_setup_selection_stops_instead_of_sending_ios_command(self):
+        child = FakeChild([12, 12])
+        self.set_fake_pexpect(child)
+
+        with self.assertRaisesRegex(RuntimeError, "reappeared"):
+            ConsoleSession(_config()).connect()
+
+        self.assertEqual(
+            [item for item in child.sent if item[0] == "sendline"],
+            [("sendline", "0")],
+        )
 
     def test_first_boot_transcript_prompts_match_expected_patterns(self):
         self.assertIsNotNone(
