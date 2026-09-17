@@ -16,6 +16,7 @@ python3 -m pip install -e .
 ```
 
 Dependencies are installed automatically. The console workflow uses the host SSH/Telnet client.
+The supported interpreter range is CPython 3.6 and newer.
 
 ## Offline install
 
@@ -52,11 +53,19 @@ Rebuild the offline tarball on a machine with internet access:
 ./build_offline_bundle.sh
 ```
 
-The bundled wheels target Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x64 with CPython 3.12. For another Python version, rebuild with matching values:
+The wheel builder can create bundles for Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x64 across CPython 3.6 and newer. The default build targets CPython 3.6 through 3.12:
 
 ```bash
-PYTHON_VERSION=311 PYTHON_ABI=cp311 ./build_offline_bundle.sh
+./build_offline_bundle.sh
 ```
+
+To build only an Ubuntu 18 x86_64 / CPython 3.6 bundle:
+
+```bash
+TARGET_PLATFORMS=manylinux2014_x86_64 PYTHON_VERSIONS=36 ./build_offline_bundle.sh
+```
+
+Python 3.6 and 3.7 use older dependency versions for compatibility. Those interpreters are end-of-life, so use this legacy bundle only where upgrading the host is not possible.
 
 Override `TARGET_PLATFORMS` to build a smaller or different wheelhouse. On Windows, validate local SSH/Telnet behavior before running `console-upgrade` in production.
 

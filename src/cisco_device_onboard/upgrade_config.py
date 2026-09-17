@@ -1,10 +1,8 @@
 """Image/server YAML loading for the dedicated console upgrade command."""
 
-from __future__ import annotations
-
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 import yaml
 
@@ -23,7 +21,7 @@ def _normalize_yaml(text: str) -> str:
     return "\n".join(lines)
 
 
-def load_upgrade_config(path: Path) -> dict[str, Any]:
+def load_upgrade_config(path: Path) -> Dict[str, Any]:
     try:
         config = yaml.safe_load(_normalize_yaml(path.read_text(encoding="utf-8"))) or {}
     except (OSError, yaml.YAMLError) as error:

@@ -82,6 +82,13 @@ def _upgrade_config(transfer_protocol="scp", skip_if_present=False):
 
 
 class ConsoleConnectionTests(unittest.TestCase):
+    @staticmethod
+    def remove_temp_file(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
     def set_fake_pexpect(self, child):
         previous_pexpect = device_setup_engine.pexpect
         device_setup_engine.pexpect = FakePexpect(child)
@@ -224,7 +231,7 @@ wan_interfaces:
 """
         )
         handle.close()
-        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        self.addCleanup(self.remove_temp_file, Path(handle.name))
 
         config = load_upgrade_config(Path(handle.name))
 
@@ -249,7 +256,7 @@ wan_interfaces:
 """
         )
         handle.close()
-        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        self.addCleanup(self.remove_temp_file, Path(handle.name))
 
         with self.assertRaisesRegex(Exception, "image.source.protocol"):
             load_upgrade_config(Path(handle.name))

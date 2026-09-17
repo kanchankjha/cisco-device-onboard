@@ -1,7 +1,5 @@
 """Batch console upgrade command driven by CSV rows and one image YAML file."""
 
-from __future__ import annotations
-
 import argparse
 import copy
 import json
@@ -10,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 from .csv_input import CsvInputError, DeviceRow, load_devices
 from .upgrade_config import UpgradeConfigError, load_upgrade_config
@@ -23,7 +21,7 @@ def _env_or_empty(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
-def _redact(value: Any, secrets: list[str]) -> Any:
+def _redact(value: Any, secrets: List[str]) -> Any:
     if isinstance(value, str):
         for secret in secrets:
             if secret:
@@ -36,7 +34,7 @@ def _redact(value: Any, secrets: list[str]) -> Any:
     return value
 
 
-def _known_secrets(config: dict[str, Any]) -> list[str]:
+def _known_secrets(config: Dict[str, Any]) -> List[str]:
     connection = config.get("device", {}).get("connection", {})
     source = config.get("image", {}).get("source", {})
     server = source.get("server", {})
@@ -49,7 +47,7 @@ def _known_secrets(config: dict[str, Any]) -> list[str]:
     ]
 
 
-def build_device_config(base: dict[str, Any], row: DeviceRow, args: argparse.Namespace) -> dict[str, Any]:
+def build_device_config(base: Dict[str, Any], row: DeviceRow, args: argparse.Namespace) -> Dict[str, Any]:
     if not row.console_ip or row.console_port is None:
         raise CsvInputError(f"CSV row {row.row_number}: console connection details are required")
     config = copy.deepcopy(base)
@@ -69,7 +67,7 @@ def build_device_config(base: dict[str, Any], row: DeviceRow, args: argparse.Nam
     return config
 
 
-def redacted_plan(rows: list[DeviceRow], config: dict[str, Any]) -> dict[str, Any]:
+def redacted_plan(rows: List[DeviceRow], config: Dict[str, Any]) -> Dict[str, Any]:
     server = config["image"]["source"]["server"]
     return {
         "rows": [
@@ -90,7 +88,7 @@ def redacted_plan(rows: list[DeviceRow], config: dict[str, Any]) -> dict[str, An
     }
 
 
-def upgrade_row(row: DeviceRow, config: dict[str, Any], report_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+def upgrade_row(row: DeviceRow, config: Dict[str, Any], report_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
     report_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f"cisco-device-{row.serial}-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -99,8 +97,14 @@ def upgrade_row(row: DeviceRow, config: dict[str, Any], report_dir: Path, args: 
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
         os.chmod(config_path, 0o600)
         command = [sys.executable, str(ENGINE_PATH), str(config_path), "--report", str(report_path)]
-        completed = subprocess.run(command, cwd=ENGINE_PATH.parent, capture_output=True, text=True)
-        result: dict[str, Any] = {"serial": row.serial, "row": row.row_number}
+        completed = subprocess.run(
+            command,
+            cwd=ENGINE_PATH.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        result: Dict[str, Any] = {"serial": row.serial, "row": row.row_number}
         secrets = _known_secrets(config)
         if report_path.is_file():
             try:
@@ -123,7 +127,7 @@ def upgrade_row(row: DeviceRow, config: dict[str, Any], report_dir: Path, args: 
         return result
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True, help="Image/server YAML configuration")
