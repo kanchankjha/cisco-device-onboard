@@ -1,13 +1,17 @@
 # Cisco Device Onboard
 
-Batch tools for Cisco appliance onboarding:
+Tools for upgrading Cisco IOS-XE appliances and onboarding them to Meraki
+Dashboard:
 
-- `console-upgrade`: upgrade IOS-XE appliances through SSH/Telnet console, enable WAN DHCP, enable cloud management, and save the configuration.
-- `dashboard-config`: claim appliances into Meraki Dashboard, create or reuse appliance networks, and verify assignment.
+- `console-upgrade` upgrades an appliance through an SSH/Telnet console.
+- `dashboard-config` claims appliances and verifies their Dashboard assignment.
 
-## Install
+## Requirements and installation
 
-From this directory:
+CPython 3.6 or newer is supported. The console workflow also requires the
+system SSH/Telnet client.
+
+Standard installation:
 
 ```bash
 python3 -m venv .venv
@@ -15,41 +19,20 @@ source .venv/bin/activate
 python3 -m pip install -e .
 ```
 
-Dependencies are installed automatically. The console workflow uses the host SSH/Telnet client.
-The supported interpreter range is CPython 3.6 and newer.
+### Offline installation
 
-## Offline install
+The offline bundle must already contain wheels compatible with the target
+Python version and operating system. It does not download packages from the
+internet.
 
-The tarball includes `offline/wheelhouse` and setup scripts for offline installs.
-The committed wheelhouse targets Linux x86_64 and includes CPython 3.6 through
-3.14; generate a platform-specific bundle when installing elsewhere.
-
-On Linux or macOS:
+With a virtual environment:
 
 ```bash
-tar -xzf cisco_device_onboard-0.1.0.tar.gz
-cd cisco_device_onboard-0.1.0
 ./install_offline.sh
 source .venv/bin/activate
 ```
 
-On Windows PowerShell:
-
-```powershell
-tar -xzf cisco_device_onboard-0.1.0.tar.gz
-cd cisco_device_onboard-0.1.0
-.\install_offline.ps1
-.\.venv\Scripts\Activate.ps1
-```
-
-### Offline install without a virtual environment
-
-The following Linux/macOS commands install into the current user's Python site
-packages and place the command-line scripts under `~/.local/bin`. They do not
-contact PyPI or create a virtual environment. Python and `pip` must already be
-installed on the offline system.
-
-Use `python3` for the active Python version, or `python3.6` on Ubuntu 18:
+Without a virtual environment on Linux or macOS:
 
 ```bash
 PYTHON_BIN=python3.6
@@ -60,82 +43,51 @@ PYTHON_BIN=python3.6
   --no-build-isolation .
 
 export PATH="$HOME/.local/bin:$PATH"
-console-upgrade --help
-dashboard-config --help
 ```
 
-The wheelhouse must contain wheels compatible with the selected Python version
-and operating system. For Python 3.6 on Ubuntu 18, build or obtain a matching
-bundle before transferring the tarball:
+For Ubuntu 18/Python 3.6, create a compatible bundle on an internet-connected
+build host before transferring it:
 
 ```bash
 TARGET_PLATFORMS=manylinux2014_x86_64 PYTHON_VERSIONS=36 ./build_offline_bundle.sh
 ```
 
-The default bundle build includes CPython 3.6 through 3.14. Use
-`PYTHON_VERSIONS` to build a smaller bundle for a specific interpreter.
-
-Verify the commands:
-
-```bash
-console-upgrade --help
-dashboard-config --help
-```
-
-Rebuild the offline tarball on a machine with internet access:
-
-```bash
-./build_offline_bundle.sh
-```
-
-The wheel builder can create bundles for Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x64 across CPython 3.6 and newer. The default build targets Linux x86_64 with CPython 3.6 through 3.14:
-
-```bash
-./build_offline_bundle.sh
-```
-
-To build only an Ubuntu 18 x86_64 / CPython 3.6 bundle:
-
-```bash
-TARGET_PLATFORMS=manylinux2014_x86_64 PYTHON_VERSIONS=36 ./build_offline_bundle.sh
-```
-
-Python 3.6 and 3.7 use older dependency versions for compatibility. Those interpreters are end-of-life, so use this legacy bundle only where upgrading the host is not possible.
-
-Override `TARGET_PLATFORMS` to build a smaller or different wheelhouse. On Windows, validate local SSH/Telnet behavior before running `console-upgrade` in production.
+The default bundle build targets Linux x86_64 and Python 3.6 through 3.14.
 
 ## Input files
 
-CSV format:
+CSV example:
 
 ```csv
 network-name,appliance-serial-number,console-ip,console-port
 Example home,AAAA-BBBB-CCCC,192.0.2.10,8235
 ```
 
-`console-upgrade` requires `appliance-serial-number`, `console-ip`, and `console-port`. `dashboard-config` requires `network-name` and `appliance-serial-number`.
+`console-upgrade` requires `appliance-serial-number`, `console-ip`, and
+`console-port`. `dashboard-config` requires `network-name` and
+`appliance-serial-number`.
 
-Copy `examples/device_upgrade.example.yaml` to a local YAML file and replace the image server values. Set `image.source.protocol` to `scp` or `ftp`; SCP is the default and recommended option. Supply console and Meraki credentials through environment variables.
+Copy `examples/device_upgrade.example.yaml` to a local file and replace the
+image-server values. SCP is the default image-transfer protocol; FTP is also
+supported.
 
 ## Console upgrade
 
-Validate the CSV/YAML and print a redacted plan without connecting:
+Preview the operation without connecting to devices:
 
 ```bash
 console-upgrade \
-  --csv examples/devices.example.csv \
-  --config examples/device_upgrade.example.yaml \
+  --csv devices.csv \
+  --config device_upgrade.yaml \
   --dry-run
 ```
 
-Run the batch:
+Run the upgrade:
 
 ```bash
 export CONSOLE_USERNAME=admin
 export CONSOLE_PASSWORD='console-password'
 export ENABLE_PASSWORD='C1scoOnboard'
-# Required only when an already cloud-managed console needs the fallback login.
-export CONSOLE_FALLBACK_PASSWORD='set-this-in-your-shell'
 
 console-upgrade \
   --csv devices.csv \
@@ -143,40 +95,42 @@ console-upgrade \
   --report-dir upgrade-reports
 ```
 
-On a first-boot IOS-XE console, the engine answers the initial setup dialog,
-supplies the enable secret and console/login password, selects option `0` to
-leave setup without saving its generated setup configuration, and then waits
-for the IOS prompt. `ENABLE_PASSWORD` is optional for this first-boot path. If
-it is omitted, the predefined `C1scoOnboard` value is used. This is a 12-character
-value containing uppercase, lowercase, and a digit. An invalid configured value
-also falls back to this predefined value. To use a different known secret, set
-`ENABLE_PASSWORD` to a 12-character value meeting the same policy.
+On first boot, the tool completes the setup dialog, uses option `0` to leave
+setup without saving its generated configuration, enables privileged mode, and
+suppresses console logging while configuring the device.
 
-For an already cloud-managed device, the engine first tries the supplied
-console username/password. If authentication is rejected, it makes one
-fallback attempt with the predefined cloud-management username `miles` and
-the password supplied through `CONSOLE_FALLBACK_PASSWORD`. The fallback
-password is read from the environment and is never stored in the repository.
-For Telnet, the fallback is attempted on the next login challenge; for SSH,
-the engine reconnects with the fallback username. Once Dashboard-enforced
-credentials are active, console access may be unavailable and the run will
-fail with the authentication error.
+`ENABLE_PASSWORD` is optional during first boot. If omitted or invalid, the
+tool uses its predefined compliant bootstrap value. For an already
+cloud-managed device, the supplied console credentials are tried first. If
+they are rejected, the tool makes one fallback attempt with username `miles`
+and the password supplied through:
 
-After entering privileged EXEC mode, the engine runs `no logging console` and
-disables terminal paging so that device logging does not obscure configuration
-and upgrade prompts. The console transcript is streamed to the terminal while
-each device is running; the JSON report remains the machine-readable result.
-If the console disconnects during an upgrade step, the same session state is
-reconnected and the workflow is retried up to three times, waiting five seconds
-between attempts. The retry count is recorded in `console_retry_count`.
+```bash
+export CONSOLE_FALLBACK_PASSWORD='known-fallback-password'
+```
 
-Run one platform type per batch. Devices with different platform families, console behaviors, image trains, or WAN interface naming should use separate CSV/YAML batches so each run has a single validated upgrade path.
+The fallback password is read from the environment and is not stored in the
+repository. SSH reconnects with the fallback username; Telnet tries it on the
+next login challenge. If Dashboard-enforced credentials are active, console
+access may be unavailable.
 
-The engine never downgrades a device. If the running version is already at or above `target_version`, image copy/install/reboot is marked `SKIPPED`; WAN DHCP and cloud management are still verified and saved. One or more WAN interfaces may be configured. When multiple interfaces are configured, the engine monitors DHCP assignment for up to `wan_dhcp_grace` seconds (60 by default); if at least one interface gets an address, it continues with the active interface(s) and reports any unassigned interfaces. It fails only when no configured WAN interface gets an address. The appliance must reach the configured SCP/FTP server. Optional CSV columns `console-protocol` and `console-username` override defaults.
+The console transcript is streamed to the terminal and retained in the JSON
+report. Temporary console disconnects are retried up to three times with a
+five-second interval.
+
+One or more WAN interfaces may be listed in `wan_interfaces`. With multiple
+interfaces, DHCP is monitored for up to `wan_dhcp_grace` seconds, which is 60
+seconds by default. The upgrade continues when at least one interface gets an
+IP address and reports unassigned interfaces. It fails only when none get an
+IP address.
+
+The tool does not downgrade a device. If the target version is already active,
+image copy and installation are skipped, while WAN and cloud-management
+verification still run.
 
 ## Dashboard configuration
 
-Dry-run:
+Preview changes:
 
 ```bash
 dashboard-config \
@@ -194,19 +148,12 @@ dashboard-config \
   --report onboarding-result.json
 ```
 
-Override organization and API base URL with `MERAKI_ORG_ID` / `--org-id` and `MERAKI_API_BASE_URL` / `--base-url`. Existing exact-name networks are reused.
+Use `MERAKI_ORG_ID`/`--org-id` and `MERAKI_API_BASE_URL`/`--base-url` to
+override the organization or API base URL.
 
-## Safety and repository hygiene
+## Safety
 
-- Use `--dry-run` before production runs.
-- `--apply` is required for Meraki writes.
-- Run one platform type per batch.
-- Do not commit real credentials, local YAML, reports, or secrets.
-- Test with one appliance before running a larger CSV.
-
-## Development
-
-```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-python3 -m compileall -q src tests
-```
+- Run `--dry-run` before production operations.
+- `--apply` is required for Dashboard changes.
+- Test with one appliance before using a larger CSV.
+- Never commit credentials, local YAML files, or generated reports.
