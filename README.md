@@ -21,6 +21,8 @@ The supported interpreter range is CPython 3.6 and newer.
 ## Offline install
 
 The tarball includes `offline/wheelhouse` and setup scripts for offline installs.
+The committed wheelhouse targets Linux x86_64 and includes CPython 3.6 through
+3.14; generate a platform-specific bundle when installing elsewhere.
 
 On Linux or macOS:
 
@@ -40,6 +42,39 @@ cd cisco_device_onboard-0.1.0
 .\.venv\Scripts\Activate.ps1
 ```
 
+### Offline install without a virtual environment
+
+The following Linux/macOS commands install into the current user's Python site
+packages and place the command-line scripts under `~/.local/bin`. They do not
+contact PyPI or create a virtual environment. Python and `pip` must already be
+installed on the offline system.
+
+Use `python3` for the active Python version, or `python3.6` on Ubuntu 18:
+
+```bash
+PYTHON_BIN=python3.6
+
+"$PYTHON_BIN" -m pip install --user --no-index --find-links offline/wheelhouse \
+  'setuptools>=58,<69' 'wheel>=0.37.1,<0.48'
+"$PYTHON_BIN" -m pip install --user --no-index --find-links offline/wheelhouse \
+  --no-build-isolation .
+
+export PATH="$HOME/.local/bin:$PATH"
+console-upgrade --help
+dashboard-config --help
+```
+
+The wheelhouse must contain wheels compatible with the selected Python version
+and operating system. For Python 3.6 on Ubuntu 18, build or obtain a matching
+bundle before transferring the tarball:
+
+```bash
+TARGET_PLATFORMS=manylinux2014_x86_64 PYTHON_VERSIONS=36 ./build_offline_bundle.sh
+```
+
+The default bundle build includes CPython 3.6 through 3.14. Use
+`PYTHON_VERSIONS` to build a smaller bundle for a specific interpreter.
+
 Verify the commands:
 
 ```bash
@@ -53,7 +88,7 @@ Rebuild the offline tarball on a machine with internet access:
 ./build_offline_bundle.sh
 ```
 
-The wheel builder can create bundles for Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x64 across CPython 3.6 and newer. The default build targets CPython 3.6 through 3.12:
+The wheel builder can create bundles for Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and Windows x64 across CPython 3.6 and newer. The default build targets Linux x86_64 with CPython 3.6 through 3.14:
 
 ```bash
 ./build_offline_bundle.sh
