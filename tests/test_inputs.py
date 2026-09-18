@@ -22,9 +22,27 @@ class InputTests(unittest.TestCase):
         self.addCleanup(self.remove_temp_file, Path(handle.name))
         return Path(handle.name)
 
-    def test_console_csv_requires_console_columns(self):
+    def test_console_csv_requires_console_endpoint_columns(self):
         path = self.write_csv("network-name,appliance-serial-number\nHome,AAAA-BBBB-CCCC\n")
-        with self.assertRaises(CsvInputError):
+        with self.assertRaisesRegex(CsvInputError, "console-ip.*console-port"):
+            load_devices(path, require_console=True)
+
+    def test_console_csv_does_not_require_username_or_protocol(self):
+        path = self.write_csv(
+            "network-name,appliance-serial-number,console-ip,console-port\n"
+            "Home,AAAA-BBBB-CCCC,192.0.2.10,8235\n"
+        )
+        rows = load_devices(path, require_console=True)
+        self.assertEqual(rows[0].console_ip, "192.0.2.10")
+        self.assertEqual(rows[0].console_port, 8235)
+
+    def test_console_csv_rejects_duplicate_console_endpoint(self):
+        path = self.write_csv(
+            "network-name,appliance-serial-number,console-ip,console-port\n"
+            "Home,AAAA-BBBB-CCCC,192.0.2.10,8235\n"
+            "Branch,DDDD-EEEE-FFFF,192.0.2.10,8235\n"
+        )
+        with self.assertRaisesRegex(CsvInputError, "console endpoint"):
             load_devices(path, require_console=True)
 
     def test_onboarding_csv_can_omit_console_columns(self):

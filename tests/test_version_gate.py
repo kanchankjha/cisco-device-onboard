@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 
 from cisco_device_onboard.device_setup_engine import (
+    ConsoleCredentialError,
     ConsoleDisconnectedError,
     _running_version,
     _version_at_least,
@@ -110,6 +111,38 @@ class VersionGateTests(unittest.TestCase):
         self.assertEqual(report["console_retry_count"], 2)
         self.assertEqual(session.connect.call_count, 3)
         self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(5)])
+
+    def test_run_upgrade_reports_credentials_without_retrying(self):
+        config = {
+            "device": {"name": "router", "connection": {}},
+            "protocol": "telnet",
+            "target_version": "26.2",
+            "wan_interfaces": ["Te0/0/8"],
+            "image": {
+                "destination": "bootflash:",
+                "source": {
+                    "path": "/images/cat9k.bin",
+                    "protocol": "scp",
+                    "server": {"ip": "192.0.2.20", "username": "image-user", "password": "image-password"},
+                },
+            },
+        }
+        session = mock.Mock()
+        session.connect.side_effect = ConsoleCredentialError(
+            "Console authentication failed for the supplied and predefined credentials"
+        )
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.ConsoleSession",
+            return_value=session,
+        ), mock.patch("cisco_device_onboard.device_setup_engine.time.sleep") as sleep:
+            report = run_upgrade(config)
+
+        self.assertEqual(report["result"], "FAILED")
+        self.assertEqual(report["failure_category"], "CONSOLE_CREDENTIALS")
+        self.assertIn("restart console-upgrade", report["recommended_action"])
+        self.assertEqual(session.connect.call_count, 1)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

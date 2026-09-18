@@ -39,6 +39,9 @@ DEFAULT_TIMEOUTS = {
     "prompt": 180,
     "reboot": 1800,
     "poll_interval": 15,
+    "server_ping_attempts": 3,
+    "server_ping_interval": 5,
+    "server_ping_timeout": 2,
     "wan_dhcp_grace": 60,
 }
 # Require a hostname and the prompt marker at the end of the received text.
@@ -102,6 +105,30 @@ class UpgradeConfigError(ValueError):
 
 class ConsoleDisconnectedError(RuntimeError):
     """Raised when the active console session is lost during an operation."""
+
+
+class ConsoleCredentialError(RuntimeError):
+    """Raised when console or enable credentials cannot authenticate the device."""
+
+    def __init__(
+        self,
+        message: str,
+        failure_category: str = "CONSOLE_CREDENTIALS",
+        recommended_action: str = "Check the console credentials and restart console-upgrade.",
+    ):
+        super().__init__(message)
+        self.failure_category = failure_category
+        self.recommended_action = recommended_action
+
+
+ENABLE_CREDENTIAL_ACTION = (
+    "Check ENABLE_PASSWORD or --enable-password, verify the device enable "
+    "password/secret, and restart console-upgrade."
+)
+CONSOLE_CREDENTIAL_ACTION = (
+    "Check CONSOLE_USERNAME/CONSOLE_PASSWORD or the CLI overrides, verify the "
+    "console credentials, and restart console-upgrade."
+)
 
 
 def _mapping(value: Any, name: str) -> Dict[str, Any]:
@@ -314,6 +341,17 @@ def _authentication_failed(output: str) -> bool:
     return re.search(AUTH_FAILURE_PATTERN, output or "") is not None
 
 
+def _ping_succeeded(output: str) -> bool:
+    """Return whether IOS reports at least one successful ICMP response."""
+
+    success_rate = re.search(
+        r"(?i)success rate is\s+(\d+)\s*(?:%|percent)", output or ""
+    )
+    if success_rate:
+        return int(success_rate.group(1)) > 0
+    return re.search(r"!{2,}", output or "") is not None
+
+
 class ConsoleSession:
     """Interactive IOS-XE console session backed by the system SSH/Telnet client."""
 
@@ -353,9 +391,11 @@ class ConsoleSession:
     def _handle_setup_invalid_input(self) -> None:
         self._bootstrap_invalid_attempts += 1
         if self._bootstrap_invalid_attempts >= MAX_BOOTSTRAP_SECRET_ATTEMPTS:
-            raise RuntimeError(
-                "Initial setup rejected the bootstrap enable secret after "
-                f"{MAX_BOOTSTRAP_SECRET_ATTEMPTS} attempts"
+            raise ConsoleCredentialError(
+                "Initial setup rejected the bootstrap enable password/secret after "
+                f"{MAX_BOOTSTRAP_SECRET_ATTEMPTS} attempts",
+                failure_category="ENABLE_CREDENTIALS",
+                recommended_action=ENABLE_CREDENTIAL_ACTION,
             )
         self._bootstrap_secret = None
         self.connection.pop("enable_password", None)
@@ -368,10 +408,11 @@ class ConsoleSession:
     def _fallback_console_password() -> str:
         password = os.environ.get(CONSOLE_FALLBACK_PASSWORD_ENV, "").strip()
         if not password:
-            raise RuntimeError(
+            raise ConsoleCredentialError(
                 "Console authentication failed; set "
                 f"{CONSOLE_FALLBACK_PASSWORD_ENV} to enable the predefined "
-                "cloud-management credential retry"
+                "cloud-management credential retry, then restart console-upgrade.",
+                recommended_action=CONSOLE_CREDENTIAL_ACTION,
             )
         return password
 
@@ -560,9 +601,13 @@ class ConsoleSession:
             elif index == 6:
                 if password_index >= len(self.passwords):
                     if fallback_attempted:
-                        self._fallback_console_password()
-                    raise RuntimeError(
-                        "Console requested a password, but no console password was configured"
+                        raise ConsoleCredentialError(
+                            "Console rejected the supplied and predefined console passwords",
+                            recommended_action=CONSOLE_CREDENTIAL_ACTION,
+                        )
+                    raise ConsoleCredentialError(
+                        "Console requested a password, but no console password was configured",
+                        recommended_action=CONSOLE_CREDENTIAL_ACTION,
                     )
                 self.child.sendline(self.passwords[password_index])
                 password_index += 1
@@ -574,8 +619,9 @@ class ConsoleSession:
                     self.child.sendline(fallback_username)
                     fallback_attempted = True
                 else:
-                    raise RuntimeError(
-                        "Console rejected both the supplied and predefined console usernames"
+                    raise ConsoleCredentialError(
+                        "Console rejected both the supplied and predefined console usernames",
+                        recommended_action=CONSOLE_CREDENTIAL_ACTION,
                     )
             elif index == 8:
                 LOG.info(
@@ -642,7 +688,10 @@ class ConsoleSession:
                     initial_probe = True
                     post_boot_prompt_deadline = None
                     continue
-                raise ConsoleDisconnectedError("Console connection closed during login")
+                raise ConsoleCredentialError(
+                    "Console authentication failed for the supplied and predefined credentials",
+                    recommended_action=CONSOLE_CREDENTIAL_ACTION,
+                )
             elif index == 16:
                 if not fallback_attempted:
                     fallback_attempted = True
@@ -663,7 +712,10 @@ class ConsoleSession:
                     initial_probe = True
                     post_boot_prompt_deadline = None
                     continue
-                raise ConsoleDisconnectedError("Console connection closed during login")
+                raise ConsoleCredentialError(
+                    "Console authentication failed for the supplied and predefined credentials",
+                    recommended_action=CONSOLE_CREDENTIAL_ACTION,
+                )
             else:
                 observed = self.child.before or ""
                 if initial_probe:
@@ -740,16 +792,27 @@ class ConsoleSession:
         if index == 0:
             enable_password = self.connection.get("enable_password")
             if not enable_password:
-                raise RuntimeError(
-                    "Device requested an enable password, but none was configured"
+                raise ConsoleCredentialError(
+                    "Device requested an enable password, but none was configured",
+                    failure_category="ENABLE_CREDENTIALS",
+                    recommended_action=ENABLE_CREDENTIAL_ACTION,
                 )
             self.child.sendline(str(enable_password))
             self.child.expect(PROMPT_PATTERN, timeout=30)
+            prompt = str(self.child.after or "").strip()
+            if prompt.endswith(">"):
+                raise ConsoleCredentialError(
+                    "The device rejected the configured enable password/secret",
+                    failure_category="ENABLE_CREDENTIALS",
+                    recommended_action=ENABLE_CREDENTIAL_ACTION,
+                )
         elif index == 1:
             prompt = str(self.child.after or "").strip()
             if prompt.endswith(">"):
-                raise RuntimeError(
-                    "Unable to enter privileged EXEC mode; console remains at Router>"
+                raise ConsoleCredentialError(
+                    "Unable to enter privileged EXEC mode; the device remains at the user prompt",
+                    failure_category="ENABLE_CREDENTIALS",
+                    recommended_action=ENABLE_CREDENTIAL_ACTION,
                 )
         elif index == 2:
             raise ConsoleDisconnectedError(
@@ -949,6 +1012,52 @@ class ConsoleSession:
             LOG.info("WAN DHCP configuration verified and saved")
         return verification
 
+    def check_image_server_reachability(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Ping the image server from the device before attempting image copy."""
+
+        server = config["image"]["source"]["server"]
+        address = str(server["ip"]).strip()
+        if any(character in address for character in "\r\n;|"):
+            raise UpgradeConfigError("image.source.server.ip contains an invalid character")
+        timeouts = config.get("timeouts", {})
+        attempts = max(1, int(timeouts.get("server_ping_attempts", 3)))
+        interval = max(0, int(timeouts.get("server_ping_interval", 5)))
+        ping_timeout = max(1, int(timeouts.get("server_ping_timeout", 2)))
+        outputs = []
+        for attempt in range(1, attempts + 1):
+            LOG.info(
+                "Pinging image server %s from the device (attempt %d/%d)",
+                address,
+                attempt,
+                attempts,
+            )
+            output = self.execute(
+                f"ping {address} repeat 1 timeout {ping_timeout}",
+                timeout=max(30, ping_timeout + 10),
+            )
+            outputs.append(f"Attempt {attempt}/{attempts}:\n{output}")
+            if _ping_succeeded(output):
+                LOG.info("Image server %s is reachable from the device", address)
+                return {
+                    "server": address,
+                    "protocol": str(config["image"]["source"].get("protocol", "scp")),
+                    "reachable": True,
+                    "attempts": attempt,
+                    "output": "\n".join(outputs),
+                }
+            if attempt < attempts and interval:
+                LOG.warning(
+                    "Image server %s did not respond to ping; retrying in %d seconds",
+                    address,
+                    interval,
+                )
+                time.sleep(interval)
+        ping_output = "\n".join(outputs)
+        raise TimeoutError(
+            f"Image server {address} was not reachable from the device after "
+            f"{attempts} ping attempts. Output:\n{ping_output}"
+        )
+
     def _wait_for_wan_dhcp(
         self, config: Dict[str, Any]
     ) -> Tuple[str, List[str], List[str]]:
@@ -1075,17 +1184,17 @@ def _run_upgrade_once(
 ) -> Dict[str, Any]:
     image_name = report["target_image"]
     try:
-        LOG.info("STEP 1/7: Connect to the device console and complete first-boot setup")
+        LOG.info("STEP 1/8: Connect to the device console and complete first-boot setup")
         session.connect()
-        LOG.info("STEP 2/7: Read the current IOS-XE version")
+        LOG.info("STEP 2/8: Read the current IOS-XE version")
         before_show_version = session.execute("show version")
         report["before_show_version"] = before_show_version
         running_version = _running_version(before_show_version)
         report["running_version"] = running_version
-        LOG.info("STEP 3/7: Configure and verify DHCP on both WAN interfaces")
+        LOG.info("STEP 3/8: Configure and verify DHCP on configured WAN interfaces")
         report["pre_upgrade_wan_dhcp"] = session.configure_wan_dhcp(config)
         if _version_at_least(running_version, config["target_version"]):
-            LOG.info("STEP 4/7: Skip image copy/install because the target is already active")
+            LOG.info("STEP 4/8: Skip image copy/install because the target is already active")
             report["upgrade_status"] = "SKIPPED"
             report["upgrade_reason"] = (
                 f"Running IOS-XE version {running_version} is already at or above "
@@ -1094,15 +1203,17 @@ def _run_upgrade_once(
             report["after_show_version"] = before_show_version
         else:
             report["upgrade_status"] = "PERFORMED"
-            LOG.info("STEP 4/7: Copy the target IOS-XE image to the device")
+            LOG.info("STEP 4/8: Verify image-server reachability from the device")
+            report["image_server_reachability"] = session.check_image_server_reachability(config)
+            LOG.info("STEP 5/8: Copy the target IOS-XE image to the device")
             session.copy_image(config, image_name)
-            LOG.info("STEP 5/7: Activate, commit, and reboot into the target image")
+            LOG.info("STEP 6/8: Activate, commit, and reboot into the target image")
             report["install_output"] = session.install_image(config, image_name)
-            LOG.info("STEP 6/7: Wait for reboot and verify the active IOS-XE image")
+            LOG.info("STEP 7/8: Wait for reboot and verify the active IOS-XE image")
             report["after_show_version"] = _wait_for_image(config, image_name, session)
         if _version_at_least(running_version, config["target_version"]):
-            LOG.info("STEP 6/7: Verify the already-active IOS-XE image")
-        LOG.info("STEP 7/7: Configure, verify, and save cloud management")
+            LOG.info("STEP 7/8: Verify the already-active IOS-XE image")
+        LOG.info("STEP 8/8: Configure, verify, and save cloud management")
         report["cloud_management"] = session.configure_cloud_management(config)
         report["result"] = "PASSED"
         return report
@@ -1110,6 +1221,9 @@ def _run_upgrade_once(
         if _is_console_disconnect(exc):
             raise
         report["error"] = str(exc)
+        if isinstance(exc, ConsoleCredentialError):
+            report["failure_category"] = exc.failure_category
+            report["recommended_action"] = exc.recommended_action
         return report
     finally:
         session.close()
@@ -1207,6 +1321,8 @@ def main() -> int:
             LOG.info("Device upgrade completed successfully")
             return 0
         LOG.error("Device upgrade failed: %s", report.get("error", "unknown error"))
+        if report.get("recommended_action"):
+            LOG.error("Recommended action: %s", report["recommended_action"])
         return 1
     except Exception as exc:
         LOG.error("Device upgrade failed: %s", exc)

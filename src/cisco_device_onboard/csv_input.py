@@ -4,7 +4,7 @@ import csv
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 
 SERIAL_PATTERN = re.compile(r"^[A-Za-z0-9]{4}(?:-[A-Za-z0-9]{4}){2}$")
@@ -46,6 +46,7 @@ def load_devices(
 
         rows: List[DeviceRow] = []
         seen: Set[str] = set()
+        seen_console_endpoints: Dict[Tuple[str, int], int] = {}
         for row_number, raw in enumerate(reader, start=2):
             values = {str(key).strip(): (value or "").strip() for key, value in raw.items() if key}
             serial = values.get("appliance-serial-number", "").upper()
@@ -73,6 +74,15 @@ def load_devices(
                 raise CsvInputError(f"CSV row {row_number}: console-ip is required")
             if require_console and console_port is None:
                 raise CsvInputError(f"CSV row {row_number}: console-port is required")
+            if require_console:
+                endpoint = (console_ip.lower(), console_port)
+                previous_row = seen_console_endpoints.get(endpoint)
+                if previous_row is not None:
+                    raise CsvInputError(
+                        f"CSV row {row_number}: console endpoint {console_ip}:{console_port} "
+                        f"is already used by row {previous_row}"
+                    )
+                seen_console_endpoints[endpoint] = row_number
             rows.append(
                 DeviceRow(
                     row_number=row_number,

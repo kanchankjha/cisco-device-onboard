@@ -3,7 +3,11 @@ import unittest
 from unittest import mock
 
 from cisco_device_onboard import device_setup_engine
-from cisco_device_onboard.device_setup_engine import ConsoleSession, UpgradeConfigError
+from cisco_device_onboard.device_setup_engine import (
+    ConsoleCredentialError,
+    ConsoleSession,
+    UpgradeConfigError,
+)
 from cisco_device_onboard.upgrade_config import load_upgrade_config
 import tempfile
 from pathlib import Path
@@ -192,6 +196,23 @@ class ConsoleConnectionTests(unittest.TestCase):
 
         self.assertIn(("sendline", "fallback-password"), second_child.sent)
 
+    def test_authentication_failure_is_reported_as_a_credential_error(self):
+        first_child = FakeChild([(16, "Permission denied", "")])
+        second_child = FakeChild([(16, "Authentication failed", "")])
+        previous_pexpect = device_setup_engine.pexpect
+        device_setup_engine.pexpect = FakePexpectSequence([first_child, second_child])
+        self.addCleanup(setattr, device_setup_engine, "pexpect", previous_pexpect)
+
+        with mock.patch.dict(
+            "os.environ", {"CONSOLE_FALLBACK_PASSWORD": "fallback-password"}, clear=False
+        ):
+            with self.assertRaises(ConsoleCredentialError) as raised:
+                ConsoleSession(_config("ssh")).connect()
+
+        self.assertIn("authentication failed", str(raised.exception).lower())
+        self.assertEqual(raised.exception.failure_category, "CONSOLE_CREDENTIALS")
+        self.assertIn("restart console-upgrade", raised.exception.recommended_action)
+
     def test_skips_basic_setup_autoinstall_and_save_dialogs(self):
         sent = self.run_connect(
             [
@@ -372,6 +393,31 @@ class ConsoleConnectionTests(unittest.TestCase):
         self.assertNotIn(
             ("sendline", "show running-config interface Te0/0/9"), child.sent
         )
+
+    def test_image_server_ping_retries_until_reachable(self):
+        child = FakeChild(
+            [
+                (0, "Success rate is 0 percent (0/1)", "Router#"),
+                (0, "Success rate is 100 percent (1/1)", "Router#"),
+            ]
+        )
+        self.set_fake_pexpect(child)
+        session = ConsoleSession(_config())
+        session.child = child
+
+        with mock.patch.object(device_setup_engine.time, "sleep") as sleep:
+            result = session.check_image_server_reachability(_upgrade_config())
+
+        self.assertTrue(result["reachable"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(
+            [value for kind, value in child.sent if kind == "sendline"],
+            [
+                "ping 192.0.2.20 repeat 1 timeout 2",
+                "ping 192.0.2.20 repeat 1 timeout 2",
+            ],
+        )
+        sleep.assert_called_once_with(5)
 
     def test_repeated_setup_selection_stops_instead_of_sending_ios_command(self):
         child = FakeChild([12, 12])

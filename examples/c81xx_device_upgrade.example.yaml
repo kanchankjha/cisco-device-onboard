@@ -12,8 +12,8 @@ image:
       password: replace-me
 
 wan_interfaces:
-  - Te0/0/8
-  - Te0/0/9
+  - GigabitEthernet0/0/0
+  - GigabitEthernet0/0/1
 
 timeouts:
   copy: 1800
