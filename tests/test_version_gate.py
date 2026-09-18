@@ -35,6 +35,9 @@ class AlreadyCurrentSession:
     def configure_cloud_management(self, config):
         return {"service_cloud_mgmt": "service cloud-mgmt connect"}
 
+    def check_internet_connectivity(self, config):
+        return {"reachable": True, "active_wan_interfaces": ["Te0/0/8"]}
+
     def close(self):
         self.closed = True
 
@@ -143,6 +146,89 @@ class VersionGateTests(unittest.TestCase):
         self.assertIn("restart console-upgrade", report["recommended_action"])
         self.assertEqual(session.connect.call_count, 1)
         sleep.assert_not_called()
+
+    def test_run_upgrade_retries_package_verification_after_deleting_image(self):
+        image_name = "cat9k-universalk9.26.2.1.SPA.bin"
+        config = {
+            "device": {"name": "router", "connection": {}},
+            "protocol": "telnet",
+            "target_version": "26.2",
+            "wan_interfaces": ["Te0/0/8"],
+            "timeouts": {"reboot": 60, "poll_interval": 1},
+            "image": {
+                "destination": "bootflash:",
+                "source": {
+                    "path": f"/images/{image_name}",
+                    "protocol": "scp",
+                    "server": {"ip": "192.0.2.20", "username": "image-user", "password": "image-password"},
+                },
+            },
+        }
+        session = mock.Mock()
+        session.execute.side_effect = [
+            "Cisco IOS XE Software, Version 26.1.1",
+            f"System image file is \"bootflash:{image_name}\"",
+        ]
+        session.configure_wan_dhcp.return_value = {"active_wan_interfaces": ["Te0/0/8"]}
+        session.check_image_server_reachability.return_value = {"reachable": True}
+        session.install_image.side_effect = [
+            "R0 FAILED: Install package verification fail",
+            "R0 FAILED: Install package verification fail",
+            "install add activate commit: SUCCESS",
+        ]
+        session.configure_cloud_management.return_value = {"cloud_mgmt_connect": "ok"}
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.ConsoleSession",
+            return_value=session,
+        ):
+            report = run_upgrade(config)
+
+        self.assertEqual(report["result"], "PASSED")
+        self.assertEqual(report["package_verification_retry_count"], 2)
+        self.assertEqual(session.copy_image.call_count, 3)
+        self.assertEqual(session.install_image.call_count, 3)
+        self.assertEqual(session.delete_image.call_count, 2)
+        self.assertEqual(len(report["install_attempts"]), 3)
+        self.assertTrue(report["install_attempts"][0]["package_verification_failed"])
+        self.assertFalse(report["install_attempts"][2]["package_verification_failed"])
+
+    def test_run_upgrade_fails_after_three_package_verification_retries(self):
+        image_name = "cat9k-universalk9.26.2.1.SPA.bin"
+        config = {
+            "device": {"name": "router", "connection": {}},
+            "protocol": "telnet",
+            "target_version": "26.2",
+            "wan_interfaces": ["Te0/0/8"],
+            "timeouts": {"reboot": 60, "poll_interval": 1},
+            "image": {
+                "destination": "bootflash:",
+                "source": {
+                    "path": f"/images/{image_name}",
+                    "protocol": "scp",
+                    "server": {"ip": "192.0.2.20", "username": "image-user", "password": "image-password"},
+                },
+            },
+        }
+        session = mock.Mock()
+        session.execute.return_value = "Cisco IOS XE Software, Version 26.1.1"
+        session.configure_wan_dhcp.return_value = {"active_wan_interfaces": ["Te0/0/8"]}
+        session.check_image_server_reachability.return_value = {"reachable": True}
+        session.install_image.return_value = "R0 FAILED: Install package verification fail"
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.ConsoleSession",
+            return_value=session,
+        ):
+            report = run_upgrade(config)
+
+        self.assertEqual(report["result"], "FAILED")
+        self.assertIn("package verification failed after 4", report["error"])
+        self.assertEqual(report["package_verification_retry_count"], 4)
+        self.assertEqual(session.copy_image.call_count, 4)
+        self.assertEqual(session.install_image.call_count, 4)
+        self.assertEqual(session.delete_image.call_count, 3)
+        session.configure_cloud_management.assert_not_called()
 
 
 if __name__ == "__main__":

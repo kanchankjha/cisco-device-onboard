@@ -86,6 +86,7 @@ DEFAULT_CONSOLE_USERNAME = "miles"
 CONSOLE_FALLBACK_PASSWORD_ENV = "CONSOLE_FALLBACK_PASSWORD"
 MAX_CONSOLE_RETRIES = 3
 CONSOLE_RETRY_INTERVAL = 5
+PACKAGE_VERIFICATION_RETRIES = 3
 
 
 def _valid_bootstrap_secret(value: str) -> bool:
@@ -300,6 +301,16 @@ def _copy_failed(output: str) -> bool:
     return any(marker in output_lower for marker in COPY_FAILURE_MARKERS)
 
 
+def _package_verification_failed(output: str) -> bool:
+    """Return whether IOS-XE rejected the image during package verification."""
+
+    return re.search(
+        r"(?i)(?:install\s+)?package\s+verification\s+"
+        r"(?:fail(?:ed|ure)?|error)",
+        output or "",
+    ) is not None
+
+
 def _image_is_present(output: str, image_name: str) -> bool:
     """Check directory output without trusting the echoed ``dir`` command."""
 
@@ -315,8 +326,8 @@ def _image_is_present(output: str, image_name: str) -> bool:
     return False
 
 
-def _interface_has_ip(output: str, interface_name: str) -> bool:
-    """Return whether an interface has a real address in ``show ip int br``."""
+def _interface_fields(output: str, interface_name: str) -> Optional[List[str]]:
+    """Return the ``show ip int br`` fields for a requested interface."""
 
     requested_suffix = re.search(r"(\d+(?:/\d+)+)$", interface_name.lower())
     requested = interface_name.lower()
@@ -331,8 +342,24 @@ def _interface_has_ip(output: str, interface_name: str) -> bool:
                 requested_suffix.group(1)
             )
         if same_interface:
-            return fields[1].lower() not in {"unassigned", "unknown", "-"}
-    return False
+            return fields
+    return None
+
+
+def _interface_has_ip(output: str, interface_name: str) -> bool:
+    """Return whether an interface has a real address in ``show ip int br``."""
+
+    fields = _interface_fields(output, interface_name)
+    return bool(fields and fields[1].lower() not in {"unassigned", "unknown", "-"})
+
+
+def _interface_is_up_with_ip(output: str, interface_name: str) -> bool:
+    """Return whether an interface has an IP and is operationally up/up."""
+
+    fields = _interface_fields(output, interface_name)
+    if not fields or fields[1].lower() in {"unassigned", "unknown", "-"}:
+        return False
+    return len(fields) >= 4 and fields[-2].lower() == "up" and fields[-1].lower() == "up"
 
 
 def _authentication_failed(output: str) -> bool:
@@ -969,6 +996,22 @@ class ConsoleSession:
                 LOG.info("Install console closed; waiting for the device to return")
                 return output
 
+    def delete_image(self, config: Dict[str, Any], image_name: str) -> str:
+        """Delete a failed image from device storage before re-copying it."""
+
+        destination = str(config["image"].get("destination", "bootflash:")).strip()
+        if not destination.endswith(":"):
+            destination += ":"
+        command = f"delete /force {destination}{image_name}"
+        LOG.info("Deleting failed image from the device: %s", command)
+        output = self.execute(command)
+        if _copy_failed(output):
+            raise RuntimeError(
+                f"Unable to delete failed image {image_name} from {destination}: {output}"
+            )
+        LOG.info("Deleted failed image from the device: %s", image_name)
+        return output
+
     def configure_wan_dhcp(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Enable DHCP on configured WAN interfaces and save before upgrading."""
 
@@ -1057,6 +1100,45 @@ class ConsoleSession:
             f"Image server {address} was not reachable from the device after "
             f"{attempts} ping attempts. Output:\n{ping_output}"
         )
+
+    def check_internet_connectivity(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Verify an operational WAN interface can reach the public Internet."""
+
+        interface_output = self.execute("show ip int br")
+        active_interfaces = [
+            interface_name
+            for interface_name in config["wan_interfaces"]
+            if _interface_is_up_with_ip(interface_output, interface_name)
+        ]
+        if not active_interfaces:
+            raise RuntimeError(
+                "No configured WAN interface is up/up with an IP address after "
+                "cloud-management configuration. Last 'show ip int br' output:\n"
+                f"{interface_output}"
+            )
+
+        ping_output = self.execute(
+            "ping 8.8.8.8 timeout 2",
+            timeout=30,
+        )
+        if not _ping_succeeded(ping_output):
+            raise RuntimeError(
+                "Internet connectivity check failed: ping to 8.8.8.8 did not "
+                f"succeed using WAN interface(s) {', '.join(active_interfaces)}. "
+                f"Ping output:\n{ping_output}"
+            )
+        LOG.info(
+            "Internet connectivity verified through WAN interface(s) %s",
+            ", ".join(active_interfaces),
+        )
+        return {
+            "checked_wan_interfaces": list(config["wan_interfaces"]),
+            "active_wan_interfaces": active_interfaces,
+            "ping_target": "8.8.8.8",
+            "ping_output": ping_output,
+            "reachable": True,
+            "show_ip_interface_brief": interface_output,
+        }
 
     def _wait_for_wan_dhcp(
         self, config: Dict[str, Any]
@@ -1184,17 +1266,17 @@ def _run_upgrade_once(
 ) -> Dict[str, Any]:
     image_name = report["target_image"]
     try:
-        LOG.info("STEP 1/8: Connect to the device console and complete first-boot setup")
+        LOG.info("STEP 1/9: Connect to the device console and complete first-boot setup")
         session.connect()
-        LOG.info("STEP 2/8: Read the current IOS-XE version")
+        LOG.info("STEP 2/9: Read the current IOS-XE version")
         before_show_version = session.execute("show version")
         report["before_show_version"] = before_show_version
         running_version = _running_version(before_show_version)
         report["running_version"] = running_version
-        LOG.info("STEP 3/8: Configure and verify DHCP on configured WAN interfaces")
+        LOG.info("STEP 3/9: Configure and verify DHCP on configured WAN interfaces")
         report["pre_upgrade_wan_dhcp"] = session.configure_wan_dhcp(config)
         if _version_at_least(running_version, config["target_version"]):
-            LOG.info("STEP 4/8: Skip image copy/install because the target is already active")
+            LOG.info("STEP 4/9: Skip image copy/install because the target is already active")
             report["upgrade_status"] = "SKIPPED"
             report["upgrade_reason"] = (
                 f"Running IOS-XE version {running_version} is already at or above "
@@ -1203,18 +1285,59 @@ def _run_upgrade_once(
             report["after_show_version"] = before_show_version
         else:
             report["upgrade_status"] = "PERFORMED"
-            LOG.info("STEP 4/8: Verify image-server reachability from the device")
+            LOG.info("STEP 4/9: Verify image-server reachability from the device")
             report["image_server_reachability"] = session.check_image_server_reachability(config)
-            LOG.info("STEP 5/8: Copy the target IOS-XE image to the device")
-            session.copy_image(config, image_name)
-            LOG.info("STEP 6/8: Activate, commit, and reboot into the target image")
-            report["install_output"] = session.install_image(config, image_name)
-            LOG.info("STEP 7/8: Wait for reboot and verify the active IOS-XE image")
+            install_attempts = []
+            total_install_attempts = PACKAGE_VERIFICATION_RETRIES + 1
+            for attempt in range(1, total_install_attempts + 1):
+                LOG.info(
+                    "STEP 5/9: Copy the target IOS-XE image to the device "
+                    "(attempt %d/%d)",
+                    attempt,
+                    total_install_attempts,
+                )
+                session.copy_image(config, image_name)
+                LOG.info(
+                    "STEP 6/9: Activate, commit, and reboot into the target image "
+                    "(attempt %d/%d)",
+                    attempt,
+                    total_install_attempts,
+                )
+                install_output = session.install_image(config, image_name)
+                verification_failed = _package_verification_failed(install_output)
+                attempt_report = {
+                    "attempt": attempt,
+                    "package_verification_failed": verification_failed,
+                    "install_output": install_output,
+                }
+                install_attempts.append(attempt_report)
+                report["install_attempts"] = install_attempts
+                report["install_output"] = install_output
+                if not verification_failed:
+                    break
+
+                report["package_verification_retry_count"] = attempt
+                if attempt > PACKAGE_VERIFICATION_RETRIES:
+                    raise RuntimeError(
+                        "IOS-XE package verification failed after "
+                        f"{total_install_attempts} image install attempts"
+                    )
+                LOG.warning(
+                    "IOS-XE package verification failed on attempt %d/%d; "
+                    "deleting the image and retrying the download/install",
+                    attempt,
+                    total_install_attempts,
+                )
+                delete_output = session.delete_image(config, image_name)
+                attempt_report["delete_output"] = delete_output
+            LOG.info("STEP 7/9: Wait for reboot and verify the active IOS-XE image")
             report["after_show_version"] = _wait_for_image(config, image_name, session)
         if _version_at_least(running_version, config["target_version"]):
-            LOG.info("STEP 7/8: Verify the already-active IOS-XE image")
-        LOG.info("STEP 8/8: Configure, verify, and save cloud management")
+            LOG.info("STEP 7/9: Verify the already-active IOS-XE image")
+        LOG.info("STEP 8/9: Configure, verify, and save cloud management")
         report["cloud_management"] = session.configure_cloud_management(config)
+        LOG.info("STEP 9/9: Verify WAN state and Internet connectivity")
+        report["internet_connectivity"] = session.check_internet_connectivity(config)
         report["result"] = "PASSED"
         return report
     except Exception as exc:

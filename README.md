@@ -241,7 +241,12 @@ Available options:
 
 The workflow completes first-boot setup when required, configures WAN DHCP,
 pings the image server from the device, copies and installs the image, verifies
-the active image, and configures cloud management.
+the active image, configures cloud management, and verifies Internet access
+through an up/up WAN interface by pinging `8.8.8.8`. If IOS-XE package
+verification fails, the tool deletes the copied image and retries the
+download/install up to three times before marking the device failed. If no
+configured WAN interface is up with an IP address, or the Internet ping fails,
+the device is marked failed.
 
 ## Running dashboard-config
 

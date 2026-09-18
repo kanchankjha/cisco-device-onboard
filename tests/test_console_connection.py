@@ -419,6 +419,33 @@ class ConsoleConnectionTests(unittest.TestCase):
         )
         sleep.assert_called_once_with(5)
 
+    def test_internet_connectivity_requires_up_wan_and_successful_ping(self):
+        child = FakeChild(
+            [
+                (
+                    0,
+                    "GigabitEthernet0/0/0 192.0.2.2 YES DHCP up up\n"
+                    "GigabitEthernet0/0/1 unassigned YES DHCP administratively down down",
+                    "Router#",
+                ),
+                (0, "Success rate is 100 percent (1/1)", "Router#"),
+            ]
+        )
+        self.set_fake_pexpect(child)
+        session = ConsoleSession(_config())
+        session.child = child
+
+        result = session.check_internet_connectivity(
+            {"wan_interfaces": ["GigabitEthernet0/0/0", "GigabitEthernet0/0/1"]}
+        )
+
+        self.assertTrue(result["reachable"])
+        self.assertEqual(result["active_wan_interfaces"], ["GigabitEthernet0/0/0"])
+        self.assertEqual(
+            [value for kind, value in child.sent if kind == "sendline"],
+            ["show ip int br", "ping 8.8.8.8 timeout 2"],
+        )
+
     def test_repeated_setup_selection_stops_instead_of_sending_ios_command(self):
         child = FakeChild([12, 12])
         self.set_fake_pexpect(child)
