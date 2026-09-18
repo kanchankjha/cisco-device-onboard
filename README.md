@@ -248,7 +248,12 @@ download/install up to three times before marking the device failed. If no
 configured WAN interface is up with an IP address, or the Internet ping fails,
 the tool waits up to five minutes, polling every 15 seconds, before marking the
 device failed. These intervals can be adjusted with `wan_internet_grace` and
-`wan_internet_poll_interval` under `timeouts`.
+`wan_internet_poll_interval` under `timeouts`. After the install command
+returns, the tool monitors the console for `rommon_monitor` seconds for delayed
+ROMMON output. If a ROMMON upgrade is detected, it recognizes the intermediate
+ROMMON reboot, waits for the device's temporary return on the old IOS-XE image,
+and adds `rommon_grace` seconds to the post-upgrade verification deadline for
+the subsequent reboot into the target image.
 
 ## Running dashboard-config
 

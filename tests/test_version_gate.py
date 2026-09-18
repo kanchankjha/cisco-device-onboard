@@ -4,6 +4,8 @@ from unittest import mock
 from cisco_device_onboard.device_setup_engine import (
     ConsoleCredentialError,
     ConsoleDisconnectedError,
+    _rommon_upgrade_detected,
+    _wait_for_image,
     _running_version,
     _version_at_least,
     run_upgrade,
@@ -115,6 +117,98 @@ class VersionGateTests(unittest.TestCase):
         self.assertEqual(session.connect.call_count, 3)
         self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(5)])
 
+    def test_post_upgrade_console_wait_logs_boot_in_progress(self):
+        image_name = "cat9k-universalk9.26.2.1.SPA.bin"
+        session = mock.Mock()
+        session.connect.side_effect = [
+            ConsoleDisconnectedError(
+                "Timed out waiting for the console login prompt after initial Enter probes"
+            ),
+            None,
+        ]
+        session.execute.return_value = (
+            f'System image file is "bootflash:{image_name}"'
+        )
+        config = {"timeouts": {"reboot": 60, "poll_interval": 1}}
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.time.monotonic", return_value=0
+        ), mock.patch("cisco_device_onboard.device_setup_engine.time.sleep"), mock.patch(
+            "cisco_device_onboard.device_setup_engine.LOG.info"
+        ) as log_info:
+            result = _wait_for_image(config, image_name, session)
+
+        self.assertIn(image_name, result)
+        messages = " ".join(str(call.args[0]) for call in log_info.call_args_list)
+        self.assertIn("still booting or not ready", messages)
+        self.assertNotIn("verification attempt failed", messages)
+
+    def test_rommon_upgrade_waits_for_intermediate_and_final_reboots(self):
+        image_name = "cat9k-universalk9.26.2.1.SPA.bin"
+        session = mock.Mock()
+        session.connect.side_effect = [None, None, None]
+        session.execute.side_effect = [
+            'System image file is "bootflash:cat9k-universalk9.26.1.1.SPA.bin"',
+            'Cisco IOS XE Software, Version 26.1.1',
+            f'System image file is "bootflash:{image_name}"',
+        ]
+        config = {"timeouts": {"reboot": 60, "poll_interval": 1}}
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.time.monotonic", return_value=0
+        ), mock.patch("cisco_device_onboard.device_setup_engine.time.sleep"), mock.patch(
+            "cisco_device_onboard.device_setup_engine.LOG.info"
+        ) as log_info:
+            result = _wait_for_image(
+                config, image_name, session, rommon_upgrade_detected=True
+            )
+
+        self.assertIn(image_name, result)
+        self.assertEqual(session.connect.call_count, 3)
+        messages = " ".join(str(call.args[0]) for call in log_info.call_args_list)
+        self.assertIn("intermediate IOS-XE image", messages)
+
+    def test_rommon_grace_extends_post_upgrade_deadline(self):
+        image_name = "cat9k-universalk9.26.2.1.SPA.bin"
+        session = mock.Mock()
+        session.connect.side_effect = [
+            ConsoleDisconnectedError("ROMMON reboot still in progress"),
+            None,
+        ]
+        session.execute.return_value = (
+            f'System image file is "bootflash:{image_name}"'
+        )
+        config = {
+            "timeouts": {
+                "reboot": 1,
+                "rommon_grace": 10,
+                "poll_interval": 1,
+            }
+        }
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.time.monotonic",
+            side_effect=[0, 0, 2, 2, 2, 2, 2, 2, 2],
+        ), mock.patch("cisco_device_onboard.device_setup_engine.time.sleep"), mock.patch(
+            "cisco_device_onboard.device_setup_engine.LOG.info"
+        ) as log_info:
+            result = _wait_for_image(
+                config, image_name, session, rommon_upgrade_detected=True
+            )
+
+        self.assertIn(image_name, result)
+        messages = " ".join(str(call.args[0]) for call in log_info.call_args_list)
+        self.assertIn("extending post-upgrade verification", messages)
+
+    def test_detects_rommon_upgrade_output(self):
+        output = """
+        Detected old ROMMON version 17.18(1.5r).s1.cp, upgrade required
+        Secure upgrade of the ROMMON image will occur after a reload.
+        Switching to ROM 1
+        """
+        self.assertTrue(_rommon_upgrade_detected(output))
+        self.assertFalse(_rommon_upgrade_detected("Image installation completed"))
+
     def test_run_upgrade_reports_credentials_without_retrying(self):
         config = {
             "device": {"name": "router", "connection": {}},
@@ -174,7 +268,11 @@ class VersionGateTests(unittest.TestCase):
         session.install_image.side_effect = [
             "R0 FAILED: Install package verification fail",
             "R0 FAILED: Install package verification fail",
-            "install add activate commit: SUCCESS",
+            """install add activate commit: SUCCESS
+            Detected old ROMMON version 17.18(1.5r).s1.cp, upgrade required
+            Secure upgrade of the ROMMON image will occur after a reload.
+            Switching to ROM 1
+            """,
         ]
         session.configure_cloud_management.return_value = {"cloud_mgmt_connect": "ok"}
 
@@ -192,6 +290,7 @@ class VersionGateTests(unittest.TestCase):
         self.assertEqual(len(report["install_attempts"]), 3)
         self.assertTrue(report["install_attempts"][0]["package_verification_failed"])
         self.assertFalse(report["install_attempts"][2]["package_verification_failed"])
+        self.assertTrue(report["rommon_upgrade_detected"])
 
     def test_run_upgrade_fails_after_three_package_verification_retries(self):
         image_name = "cat9k-universalk9.26.2.1.SPA.bin"

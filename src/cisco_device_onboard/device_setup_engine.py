@@ -14,7 +14,6 @@ import logging
 import os
 import re
 import shlex
-import string
 import sys
 import time
 from datetime import datetime, timezone
@@ -38,6 +37,8 @@ DEFAULT_TIMEOUTS = {
     "install": 600,
     "prompt": 180,
     "reboot": 1800,
+    "rommon_monitor": 60,
+    "rommon_grace": 900,
     "poll_interval": 15,
     "server_ping_attempts": 3,
     "server_ping_interval": 5,
@@ -51,6 +52,7 @@ DEFAULT_TIMEOUTS = {
 # This avoids matching an echoed command such as ``Router#dir ...`` while also
 # handling boot/syslog text that is immediately adjacent to the prompt.
 PROMPT_PATTERN = r"(?m)[A-Za-z0-9_.-]+(?:\([^\r\n)]*\))?[>#][ \t]*(?=\r?\n|$)"
+ROMMON_OUTPUT_PATTERN = r"(?i)rommon"
 PASSWORD_PATTERN = r"(?i)(?:password|passphrase)\s*:"
 USERNAME_PATTERN = r"(?i)(?:username|login)\s*:"
 AUTH_FAILURE_PATTERN = r"(?i)(?:permission denied|authentication failed|login incorrect|login failed|access denied)"
@@ -83,7 +85,6 @@ MAX_CONSOLE_WAKEUPS = 6
 INITIAL_CONSOLE_PROBE_INTERVAL = 5
 MAX_BOOTSTRAP_SECRET_ATTEMPTS = 3
 BOOTSTRAP_SECRET_LENGTH = 12
-BOOTSTRAP_SECRET_ALPHABET = string.ascii_letters + string.digits
 DEFAULT_BOOTSTRAP_SECRET = "C1scoOnboard"
 DEFAULT_CONSOLE_USERNAME = "miles"
 CONSOLE_FALLBACK_PASSWORD_ENV = "CONSOLE_FALLBACK_PASSWORD"
@@ -95,7 +96,7 @@ PACKAGE_VERIFICATION_RETRIES = 3
 def _valid_bootstrap_secret(value: str) -> bool:
     return (
         len(value) == BOOTSTRAP_SECRET_LENGTH
-        and all(character in BOOTSTRAP_SECRET_ALPHABET for character in value)
+        and re.fullmatch(r"[A-Za-z0-9]{12}", value) is not None
         and any(character.isupper() for character in value)
         and any(character.islower() for character in value)
         and any(character.isdigit() for character in value)
@@ -314,6 +315,22 @@ def _package_verification_failed(output: str) -> bool:
     ) is not None
 
 
+def _rommon_upgrade_detected(output: str) -> bool:
+    """Return whether IOS-XE reported that a ROMMON upgrade is required."""
+
+    output_lower = (output or "").lower()
+    return "rommon" in output_lower and any(
+        marker in output_lower
+        for marker in (
+            "upgrade required",
+            "needs to upgrade",
+            "upgrading to newer rommon",
+            "secure upgrade of the rommon",
+            "switching to rom",
+        )
+    )
+
+
 def _image_is_present(output: str, image_name: str) -> bool:
     """Check directory output without trusting the echoed ``dir`` command."""
 
@@ -393,7 +410,6 @@ class ConsoleSession:
         self._configured_enable_password = str(
             self.connection.get("enable_password", "")
         ).strip()
-        self._bootstrap_secret: Optional[str] = None
         self._bootstrap_invalid_attempts = 0
         self._setup_selection_sent = False
 
@@ -402,16 +418,14 @@ class ConsoleSession:
             self._configured_enable_password
         ):
             return self._configured_enable_password
-        if self._configured_enable_password and self._bootstrap_secret is None:
+        if self._configured_enable_password:
             LOG.warning(
                 "Configured enable password does not meet the first-boot policy; "
                 "using the predefined compliant bootstrap secret"
             )
-        if self._bootstrap_secret is None:
-            self._bootstrap_secret = DEFAULT_BOOTSTRAP_SECRET
-            self.connection["enable_password"] = self._bootstrap_secret
-            LOG.info("Using the predefined 12-character enable secret for initial setup")
-        return self._bootstrap_secret
+        self.connection["enable_password"] = DEFAULT_BOOTSTRAP_SECRET
+        LOG.info("Using the predefined 12-character enable secret for initial setup")
+        return DEFAULT_BOOTSTRAP_SECRET
 
     def _send_bootstrap_secret(self) -> None:
         if self.child is None:
@@ -427,7 +441,6 @@ class ConsoleSession:
                 failure_category="ENABLE_CREDENTIALS",
                 recommended_action=ENABLE_CREDENTIAL_ACTION,
             )
-        self._bootstrap_secret = None
         self.connection.pop("enable_password", None)
         LOG.warning(
             "Initial setup rejected the bootstrap enable secret; retrying with the "
@@ -994,10 +1007,53 @@ class ConsoleSession:
             elif index == 2:
                 self.child.sendline("")
             elif index == 3:
-                return output
+                return output + self._monitor_rommon_upgrade(config)
             else:
                 LOG.info("Install console closed; waiting for the device to return")
-                return output
+                return output + self._monitor_rommon_upgrade(config)
+
+    def _monitor_rommon_upgrade(self, config: Dict[str, Any]) -> str:
+        """Observe the console after install completion for delayed ROMMON output."""
+
+        monitor_timeout = max(
+            0, int(config.get("timeouts", {}).get("rommon_monitor", 60))
+        )
+        if monitor_timeout == 0 or self.child is None:
+            return ""
+
+        deadline = time.monotonic() + monitor_timeout
+        output = ""
+        detected = False
+        while time.monotonic() < deadline:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                index = self.child.expect(
+                    [ROMMON_OUTPUT_PATTERN, pexpect.EOF, pexpect.TIMEOUT],
+                    timeout=remaining,
+                )
+            except pexpect.TIMEOUT:
+                break
+            output += self.child.before or ""
+            if index == 0:
+                matched = self.child.after
+                if isinstance(matched, str):
+                    output += matched
+                if not detected:
+                    detected = True
+                    LOG.info(
+                        "ROMMON upgrade activity observed during post-install console monitoring"
+                    )
+            elif index == 1:
+                break
+            else:
+                break
+
+        if detected:
+            LOG.info(
+                "ROMMON console monitoring captured output; allowing the extended "
+                "reboot grace period for the ROMMON and IOS-XE reboots"
+            )
+        return output
 
     def delete_image(self, config: Dict[str, Any], image_name: str) -> str:
         """Delete a failed image from device storage before re-copying it."""
@@ -1261,11 +1317,23 @@ class ConsoleSession:
 
 
 def _wait_for_image(
-    config: Dict[str, Any], image_name: str, session: ConsoleSession
+    config: Dict[str, Any],
+    image_name: str,
+    session: ConsoleSession,
+    rommon_upgrade_detected: bool = False,
 ) -> str:
-    deadline = time.monotonic() + int(config["timeouts"]["reboot"])
+    reboot_timeout = max(0, int(config["timeouts"]["reboot"]))
+    rommon_grace = 0
+    if rommon_upgrade_detected:
+        rommon_grace = max(0, int(config["timeouts"].get("rommon_grace", 900)))
+        LOG.info(
+            "ROMMON upgrade detected; extending post-upgrade verification by %d seconds",
+            rommon_grace,
+        )
+    deadline = time.monotonic() + reboot_timeout + rommon_grace
     last_error = None
     first_attempt = True
+    verification_attempt = 0
     while time.monotonic() < deadline:
         # install add activate commit reloads the router, so the original
         # Telnet session is stale. Reconnect before the first show version
@@ -1281,6 +1349,7 @@ def _wait_for_image(
             if time.monotonic() >= deadline:
                 break
         first_attempt = False
+        verification_attempt += 1
         try:
             LOG.info("Connecting to the console to verify the post-upgrade image")
             session.connect()
@@ -1289,15 +1358,30 @@ def _wait_for_image(
             if _target_is_active(output, image_name):
                 LOG.info("Target image is active: %s", image_name)
                 return output
-            LOG.info("Device is reachable but the target image is not active yet")
+            if rommon_upgrade_detected:
+                LOG.info(
+                    "Device returned on the intermediate IOS-XE image after the "
+                    "ROMMON upgrade; waiting for the automatic IOS-XE reboot"
+                )
+            else:
+                LOG.info("Device is reachable but the target image is not active yet")
         except Exception as exc:
             last_error = exc
-            LOG.info("Post-upgrade console verification attempt failed: %s", exc)
+            remaining = max(0, int(deadline - time.monotonic()))
+            LOG.info(
+                "Post-upgrade console is still booting or not ready to respond; "
+                "continuing verification (attempt %d, approximately %d seconds "
+                "remaining): %s",
+                verification_attempt,
+                remaining,
+                exc,
+            )
     detail = (
         f"last error: {last_error}" if last_error else "target version was not reported"
     )
     raise TimeoutError(
-        f"Image {image_name} did not become active within the reboot timeout ({detail})"
+        f"Image {image_name} did not become active within the post-upgrade "
+        f"verification timeout ({reboot_timeout + rommon_grace} seconds; {detail})"
     )
 
 
@@ -1359,6 +1443,12 @@ def _run_upgrade_once(
                 install_attempts.append(attempt_report)
                 report["install_attempts"] = install_attempts
                 report["install_output"] = install_output
+                if _rommon_upgrade_detected(install_output):
+                    report["rommon_upgrade_detected"] = True
+                    LOG.info(
+                        "ROMMON upgrade detected; waiting through the intermediate "
+                        "ROMMON reboot and subsequent IOS-XE reboot"
+                    )
                 if not verification_failed:
                     break
 
@@ -1377,7 +1467,12 @@ def _run_upgrade_once(
                 delete_output = session.delete_image(config, image_name)
                 attempt_report["delete_output"] = delete_output
             LOG.info("STEP 7/9: Wait for reboot and verify the active IOS-XE image")
-            report["after_show_version"] = _wait_for_image(config, image_name, session)
+            report["after_show_version"] = _wait_for_image(
+                config,
+                image_name,
+                session,
+                rommon_upgrade_detected=bool(report["rommon_upgrade_detected"]),
+            )
         if _version_at_least(running_version, config["target_version"]):
             LOG.info("STEP 7/9: Verify the already-active IOS-XE image")
         LOG.info("STEP 8/9: Configure, verify, and save cloud management")
@@ -1410,6 +1505,7 @@ def run_upgrade(config: Dict[str, Any]) -> Dict[str, Any]:
         "wan_interfaces": config["wan_interfaces"],
         "upgrade_status": "NOT_STARTED",
         "console_retry_count": 0,
+        "rommon_upgrade_detected": False,
         "result": "FAILED",
     }
     while True:

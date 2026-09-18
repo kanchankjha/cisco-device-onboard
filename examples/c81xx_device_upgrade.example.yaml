@@ -19,6 +19,8 @@ timeouts:
   copy: 1800
   install: 600
   reboot: 1800
+  rommon_monitor: 60
+  rommon_grace: 900
   poll_interval: 15
   prompt: 180
   dhcp: 300

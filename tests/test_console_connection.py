@@ -258,7 +258,31 @@ class ConsoleConnectionTests(unittest.TestCase):
         )
         self.assertIn(("send", "\r"), sent)
 
-    def test_initial_setup_generates_and_confirms_bootstrap_secret(self):
+    def test_post_install_monitor_captures_delayed_rommon_output(self):
+        child = FakeChild(
+            [
+                (0, "Detected old ", "ROMMON"),
+                (2, " upgrade output", ""),
+            ]
+        )
+        config = _config()
+        config.update(_upgrade_config())
+        config["timeouts"]["rommon_monitor"] = 1
+        session = ConsoleSession(config)
+        session.child = child
+        previous_pexpect = device_setup_engine.pexpect
+        device_setup_engine.pexpect = FakePexpect(child)
+        self.addCleanup(setattr, device_setup_engine, "pexpect", previous_pexpect)
+
+        with mock.patch(
+            "cisco_device_onboard.device_setup_engine.time.monotonic", return_value=0
+        ):
+            output = session._monitor_rommon_upgrade(config)
+
+        self.assertIn("Detected old ROMMON", output)
+        self.assertIn("upgrade output", output)
+
+    def test_initial_setup_uses_and_confirms_predefined_bootstrap_secret(self):
         config = _config()
         config["device"]["connection"].pop("enable_password")
         child = FakeChild(
@@ -287,10 +311,7 @@ class ConsoleConnectionTests(unittest.TestCase):
         self.assertEqual(setup_secrets[0], setup_secrets[1])
         self.assertEqual(setup_secrets[0], setup_secrets[2])
         self.assertEqual(setup_secrets[2], setup_secrets[3])
-        self.assertEqual(len(setup_secrets[0]), 12)
-        self.assertTrue(any(character.isupper() for character in setup_secrets[0]))
-        self.assertTrue(any(character.islower() for character in setup_secrets[0]))
-        self.assertTrue(any(character.isdigit() for character in setup_secrets[0]))
+        self.assertEqual(setup_secrets[0], device_setup_engine.DEFAULT_BOOTSTRAP_SECRET)
         self.assertIn(("sendline", "no logging console"), child.sent)
 
     def test_initial_setup_replaces_invalid_configured_secret(self):
@@ -314,15 +335,11 @@ class ConsoleConnectionTests(unittest.TestCase):
         ConsoleSession(_config()).connect()
 
         sent_values = [value for kind, value in child.sent if kind == "sendline"]
-        generated = sent_values[1]
+        fallback = sent_values[1]
         self.assertEqual(sent_values[1], sent_values[2])
-        self.assertEqual(generated, device_setup_engine.DEFAULT_BOOTSTRAP_SECRET)
-        self.assertEqual(len(generated), 12)
-        self.assertTrue(any(character.isupper() for character in generated))
-        self.assertTrue(any(character.islower() for character in generated))
-        self.assertTrue(any(character.isdigit() for character in generated))
+        self.assertEqual(fallback, device_setup_engine.DEFAULT_BOOTSTRAP_SECRET)
 
-    def test_initial_setup_replaces_generated_secret_after_invalid_input(self):
+    def test_initial_setup_reuses_predefined_secret_after_invalid_input(self):
         config = _config()
         config["device"]["connection"].pop("enable_password")
         child = FakeChild(
