@@ -1,3 +1,4 @@
 network-name,appliance-serial-number,console-ip,console-port
-Example home 1,AAAA-BBBB-CCCC,192.0.2.10,8235
-Example home 2,DDDD-EEEE-FFFF,192.0.2.11,8235
+Branch-city-1,AAAA-BBBB-CCCC,192.0.2.10,8235
+Branch-city-2,DDDD-EEEE-FFFF,192.0.2.10,8236
+DC-city-3,AAAA-FFFF-1234,192.0.2.11,8235
