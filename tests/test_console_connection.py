@@ -413,8 +413,8 @@ class ConsoleConnectionTests(unittest.TestCase):
         self.assertEqual(
             [value for kind, value in child.sent if kind == "sendline"],
             [
-                "ping 192.0.2.20 repeat 1 timeout 2",
-                "ping 192.0.2.20 repeat 1 timeout 2",
+                "ping 192.0.2.20 timeout 2",
+                "ping 192.0.2.20 timeout 2",
             ],
         )
         sleep.assert_called_once_with(5)
@@ -445,6 +445,33 @@ class ConsoleConnectionTests(unittest.TestCase):
             [value for kind, value in child.sent if kind == "sendline"],
             ["show ip int br", "ping 8.8.8.8 timeout 2"],
         )
+
+    def test_internet_connectivity_waits_for_wan_interface_to_come_up(self):
+        child = FakeChild(
+            [
+                (0, "GigabitEthernet0/0/0 unassigned YES DHCP down down", "Router#"),
+                (0, "GigabitEthernet0/0/0 192.0.2.2 YES DHCP up up", "Router#"),
+                (0, "Success rate is 100 percent (1/1)", "Router#"),
+            ]
+        )
+        self.set_fake_pexpect(child)
+        session = ConsoleSession(_config())
+        session.child = child
+
+        with mock.patch.object(device_setup_engine.time, "sleep") as sleep:
+            result = session.check_internet_connectivity(
+                {
+                    "wan_interfaces": ["GigabitEthernet0/0/0"],
+                    "timeouts": {
+                        "wan_internet_grace": 300,
+                        "wan_internet_poll_interval": 15,
+                    },
+                }
+            )
+
+        self.assertTrue(result["reachable"])
+        self.assertEqual(result["attempts"], 2)
+        sleep.assert_called_once_with(15)
 
     def test_repeated_setup_selection_stops_instead_of_sending_ios_command(self):
         child = FakeChild([12, 12])

@@ -246,7 +246,9 @@ through an up/up WAN interface by pinging `8.8.8.8`. If IOS-XE package
 verification fails, the tool deletes the copied image and retries the
 download/install up to three times before marking the device failed. If no
 configured WAN interface is up with an IP address, or the Internet ping fails,
-the device is marked failed.
+the tool waits up to five minutes, polling every 15 seconds, before marking the
+device failed. These intervals can be adjusted with `wan_internet_grace` and
+`wan_internet_poll_interval` under `timeouts`.
 
 ## Running dashboard-config
 

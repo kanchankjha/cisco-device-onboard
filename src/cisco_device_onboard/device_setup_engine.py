@@ -42,6 +42,9 @@ DEFAULT_TIMEOUTS = {
     "server_ping_attempts": 3,
     "server_ping_interval": 5,
     "server_ping_timeout": 2,
+    "wan_internet_grace": 300,
+    "wan_internet_poll_interval": 15,
+    "internet_ping_timeout": 2,
     "wan_dhcp_grace": 60,
 }
 # Require a hostname and the prompt marker at the end of the received text.
@@ -1075,7 +1078,7 @@ class ConsoleSession:
                 attempts,
             )
             output = self.execute(
-                f"ping {address} repeat 1 timeout {ping_timeout}",
+                f"ping {address} timeout {ping_timeout}",
                 timeout=max(30, ping_timeout + 10),
             )
             outputs.append(f"Attempt {attempt}/{attempts}:\n{output}")
@@ -1104,41 +1107,84 @@ class ConsoleSession:
     def check_internet_connectivity(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Verify an operational WAN interface can reach the public Internet."""
 
-        interface_output = self.execute("show ip int br")
-        active_interfaces = [
-            interface_name
-            for interface_name in config["wan_interfaces"]
-            if _interface_is_up_with_ip(interface_output, interface_name)
-        ]
-        if not active_interfaces:
-            raise RuntimeError(
-                "No configured WAN interface is up/up with an IP address after "
-                "cloud-management configuration. Last 'show ip int br' output:\n"
-                f"{interface_output}"
-            )
+        timeouts = config.get("timeouts", {})
+        grace_period = max(0, int(timeouts.get("wan_internet_grace", 300)))
+        poll_interval = max(
+            1, int(timeouts.get("wan_internet_poll_interval", 15))
+        )
+        ping_timeout = max(1, int(timeouts.get("internet_ping_timeout", 2)))
+        deadline = time.monotonic() + grace_period
+        attempts = 0
+        last_interface_output = ""
+        last_ping_output = ""
+        last_error = None
 
-        ping_output = self.execute(
-            "ping 8.8.8.8 timeout 2",
-            timeout=30,
+        while True:
+            attempts += 1
+            try:
+                interface_output = self.execute("show ip int br")
+                last_interface_output = interface_output
+                active_interfaces = [
+                    interface_name
+                    for interface_name in config["wan_interfaces"]
+                    if _interface_is_up_with_ip(interface_output, interface_name)
+                ]
+                if not active_interfaces:
+                    LOG.info(
+                        "WAN interface is not ready after cloud management "
+                        "(attempt %d); waiting for up/up with an IP",
+                        attempts,
+                    )
+                else:
+                    ping_output = self.execute(
+                        f"ping 8.8.8.8 timeout {ping_timeout}",
+                        timeout=max(30, ping_timeout + 10),
+                    )
+                    last_ping_output = ping_output
+                    if _ping_succeeded(ping_output):
+                        LOG.info(
+                            "Internet connectivity verified through WAN interface(s) %s",
+                            ", ".join(active_interfaces),
+                        )
+                        return {
+                            "checked_wan_interfaces": list(config["wan_interfaces"]),
+                            "active_wan_interfaces": active_interfaces,
+                            "attempts": attempts,
+                            "waited_seconds": max(
+                                0, int(grace_period - max(0, deadline - time.monotonic()))
+                            ),
+                            "ping_target": "8.8.8.8",
+                            "ping_output": ping_output,
+                            "reachable": True,
+                            "show_ip_interface_brief": interface_output,
+                        }
+                    LOG.warning(
+                        "WAN interface(s) %s are up with an IP, but ping to "
+                        "8.8.8.8 failed; continuing the readiness check",
+                        ", ".join(active_interfaces),
+                    )
+            except ConsoleDisconnectedError as exc:
+                last_error = str(exc)
+                LOG.warning(
+                    "Console disconnected during the post-cloud WAN readiness "
+                    "check; reconnecting before the next probe: %s",
+                    exc,
+                )
+                self.close()
+                if time.monotonic() < deadline:
+                    self.connect()
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
+
+        detail = (
+            f" Last console error: {last_error}." if last_error else ""
         )
-        if not _ping_succeeded(ping_output):
-            raise RuntimeError(
-                "Internet connectivity check failed: ping to 8.8.8.8 did not "
-                f"succeed using WAN interface(s) {', '.join(active_interfaces)}. "
-                f"Ping output:\n{ping_output}"
-            )
-        LOG.info(
-            "Internet connectivity verified through WAN interface(s) %s",
-            ", ".join(active_interfaces),
+        raise TimeoutError(
+            "WAN/Internet readiness check did not succeed within "
+            f"{grace_period} seconds.{detail} Last 'show ip int br' output:\n"
+            f"{last_interface_output}\nLast ping output:\n{last_ping_output}"
         )
-        return {
-            "checked_wan_interfaces": list(config["wan_interfaces"]),
-            "active_wan_interfaces": active_interfaces,
-            "ping_target": "8.8.8.8",
-            "ping_output": ping_output,
-            "reachable": True,
-            "show_ip_interface_brief": interface_output,
-        }
 
     def _wait_for_wan_dhcp(
         self, config: Dict[str, Any]
