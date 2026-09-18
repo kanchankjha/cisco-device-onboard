@@ -12,17 +12,23 @@ This package provides two commands:
 - The device console must be connected to the console server listed in the CSV.
 - At least one configured WAN interface must be connected to a DHCP-capable network with Internet access.
 - The device must reach the configured SCP/FTP image server. The tool pings the server from the device before copying the image.
-- Select `--batch-size` based on the number of simultaneous console sessions
-  supported by the host/console server and the image-server/network bandwidth
-  available for downloading images to all devices in parallel. Increase it only
-  when both resources can support the additional concurrent sessions and image
-  transfers.
 - The image must be compatible with the device and there must be enough device storage.
 - `dashboard-config` requires a Meraki API key with permission to claim devices and modify networks.
 - The Dashboard organization ID is mandatory; the tool does not use a default organization.
-- Do not commit API keys, passwords, local YAML files, or generated reports.
+- Protect API keys, passwords, local YAML files, and generated reports.
 
 Windows installation is supported, but native Windows console-upgrade execution requires compatible SSH/Telnet clients and a runtime supported by `pexpect`. Validate console access on the target Windows host first. WSL is an alternative when native console behavior is unavailable. `dashboard-config` uses HTTPS and does not require a console client.
+
+## Quick start
+
+1. Install the package using the instructions below.
+2. Create `devices.csv` using the CSV format in this guide.
+3. Copy the platform-specific YAML example and update the image-server values:
+   - `examples/c81xx_device_upgrade.example.yaml` for C81xx.
+   - `examples/c82xx_device_upgrade.example.yaml` for C82xx.
+4. Set the required credentials as environment variables.
+5. Run `console-upgrade --dry-run` to validate the inputs.
+6. Run the upgrade with a batch size supported by the host and image server.
 
 ## Installation
 
@@ -146,44 +152,19 @@ Create the YAML file from the platform-specific example:
 - `examples/c81xx_device_upgrade.example.yaml` for C81xx appliances.
 - `examples/c82xx_device_upgrade.example.yaml` for C82xx appliances.
 
-The generic `examples/device_upgrade.example.yaml` remains available as a
-reference. Replace the image-server values and select the WAN interfaces that
-match the appliance.
+Replace the image-server values, adjust timeouts if needed, and verify that
+the WAN interfaces match the appliance.
 
-```yaml
-target_version: "26.2"
-
-image:
-  destination: "bootflash:"
-  skip_if_present: false
-  source:
-    protocol: scp
-    path: /path/to/approved-iosxe-image.bin
-    server:
-      ip: 192.0.2.20
-      username: scp-user
-      password: replace-me
-
-wan_interfaces:
-  - Te0/0/8
-  - Te0/0/9
-
-timeouts:
-  copy: 1800
-  install: 600
-  reboot: 1800
-  poll_interval: 15
-  prompt: 180
-  wan_dhcp_grace: 60
-  server_ping_attempts: 3
-  server_ping_interval: 5
-  server_ping_timeout: 2
-```
-
-`target_version` is the minimum IOS-XE version; the tool does not downgrade.
-`image.source` identifies the image-transfer protocol, absolute image path,
-and server credentials. `wan_interfaces` accepts one or more interfaces.
-`server_ping_*` controls the device-side reachability check before image copy.
+| YAML field | Purpose |
+|---|---|
+| `target_version` | Minimum IOS-XE version; the tool does not downgrade. |
+| `image.destination` | Device storage destination, normally `bootflash:`. |
+| `image.skip_if_present` | Skip image transfer when the image is already present. |
+| `image.source.protocol` | Image-transfer protocol: `scp` or `ftp`. |
+| `image.source.path` | Absolute path to the image on the image server. |
+| `image.source.server` | Image-server IP/hostname and transfer credentials. |
+| `wan_interfaces` | One or more device interfaces used for DHCP and connectivity. |
+| `timeouts` | Copy, install, reboot, DHCP, prompt, and image-server ping limits. |
 
 ## Environment variables
 
@@ -286,6 +267,8 @@ dashboard-config \
 For each CSV row, the command creates or reuses an IOS XE network, claims the
 serial into organization inventory, adds it as a managed device, and verifies
 the assignment. `--org-id` is mandatory.
+
+The JSON Dashboard report is written to the path supplied with `--report`.
 
 | Option | Purpose |
 |---|---|
