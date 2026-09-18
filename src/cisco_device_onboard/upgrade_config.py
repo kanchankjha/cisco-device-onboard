@@ -1,6 +1,7 @@
 """Image/server YAML loading for the dedicated console upgrade command."""
 
 import re
+import os
 from pathlib import Path
 from typing import Any, Dict
 
@@ -28,6 +29,36 @@ def load_upgrade_config(path: Path) -> Dict[str, Any]:
         raise UpgradeConfigError(f"Unable to read upgrade YAML: {error}") from error
     if not isinstance(config, dict):
         raise UpgradeConfigError("Upgrade YAML root must be a mapping")
+    device = config.get("device") or {}
+    if not isinstance(device, dict):
+        raise UpgradeConfigError("device must be a mapping when specified")
+    connection = device.get("connection") or {}
+    if not isinstance(connection, dict):
+        raise UpgradeConfigError("device.connection must be a mapping when specified")
+    if connection.get("proxy"):
+        jump_host = config.get("jump_host") or {}
+        if not isinstance(jump_host, dict):
+            raise UpgradeConfigError("jump_host must be a mapping when proxy is enabled")
+        jump_username = jump_host.get("username") or os.environ.get(
+            "JUMP_HOST_USERNAME", ""
+        )
+        jump_password = jump_host.get("password") or os.environ.get(
+            "JUMP_HOST_PASSWORD", ""
+        )
+        missing_jump_fields = [
+            key
+            for key, value in (
+                ("ip", jump_host.get("ip")),
+                ("username", jump_username),
+                ("password", jump_password),
+            )
+            if value is None or str(value).strip() == ""
+        ]
+        if missing_jump_fields:
+            raise UpgradeConfigError(
+                "Proxy-enabled console access requires jump_host: "
+                + ", ".join(missing_jump_fields)
+            )
     target_version = str(config.get("target_version", "26.2")).strip()
     image = config.get("image") or {}
     source = image.get("source") or {}

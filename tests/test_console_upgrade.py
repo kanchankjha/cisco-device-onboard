@@ -1,4 +1,5 @@
 import io
+import csv
 import subprocess
 import tempfile
 import threading
@@ -47,6 +48,10 @@ class ConsoleUpgradeOutputTests(unittest.TestCase):
             with mock.patch("cisco_device_onboard.console_upgrade.subprocess.Popen", return_value=process) as popen:
                 with redirect_stdout(output):
                     result = upgrade_row(row, config, Path(temp_dir), args)
+            log_path = Path(temp_dir) / "AAAA-BBBB-CCCC.log"
+            json_path = Path(temp_dir) / "AAAA-BBBB-CCCC.json"
+            self.assertTrue(log_path.is_file())
+            self.assertFalse(json_path.exists())
 
         log_output = output.getvalue()
         self.assertIn("device=AAAA-BBBB-CCCC", log_output)
@@ -60,6 +65,28 @@ class ConsoleUpgradeOutputTests(unittest.TestCase):
         command = popen_args[0]
         self.assertEqual(command[1], "-u")
         self.assertEqual(popen_kwargs["stderr"], subprocess.STDOUT)
+
+    def test_write_summary_csv_uses_input_order_and_pass_fail_status(self):
+        results = [
+            {"row": 3, "serial": "DDDD-EEEE-FFFF", "result": "FAILED"},
+            {"row": 2, "serial": "AAAA-BBBB-CCCC", "result": "PASSED"},
+            {"row": 4, "serial": "GGGG-HHHH-IIII", "result": "skipped"},
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            summary_path = console_upgrade._write_summary_csv(Path(temp_dir), results)
+            with summary_path.open(newline="", encoding="utf-8") as summary_file:
+                rows = list(csv.reader(summary_file))
+
+        self.assertEqual(
+            rows,
+            [
+                ["appliance-serial", "status"],
+                ["AAAA-BBBB-CCCC", "PASSED"],
+                ["DDDD-EEEE-FFFF", "FAILED"],
+                ["GGGG-HHHH-IIII", "PASSED"],
+            ],
+        )
 
     def test_main_runs_devices_in_bounded_batches(self):
         rows = [
@@ -126,6 +153,8 @@ class ConsoleUpgradeOutputTests(unittest.TestCase):
                             "2",
                         ]
                     )
+            summary_path = Path(temp_dir) / "console-upgrade-summary.csv"
+            self.assertTrue(summary_path.is_file())
 
         self.assertEqual(result, 0)
         self.assertEqual(maximum_active, 2)
@@ -134,6 +163,39 @@ class ConsoleUpgradeOutputTests(unittest.TestCase):
         self.assertLess(first_batch_end, second_batch_start)
         self.assertIn("BATCH 1/3 START", output.getvalue())
         self.assertIn("BATCH 3/3 END", output.getvalue())
+        self.assertIn("Summary CSV:", output.getvalue())
+
+    def test_build_device_config_applies_jump_host_environment_overrides(self):
+        row = DeviceRow(
+            network_name="network1",
+            serial="AAAA-BBBB-CCCC",
+            console_ip="192.0.2.10",
+            console_port=8403,
+            extra={},
+            row_number=2,
+        )
+        base_config = {
+            "device": {"connection": {"proxy": True}},
+            "jump_host": {"ip": "172.29.3.64", "port": 2023},
+        }
+        args = SimpleNamespace(
+            console_protocol="telnet",
+            console_username="",
+            console_password="",
+            console_password_env="CONSOLE_PASSWORD",
+            enable_password="",
+            enable_password_env="ENABLE_PASSWORD",
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {"JUMP_HOST_USERNAME": "meraki", "JUMP_HOST_PASSWORD": "jump-pass"},
+            clear=False,
+        ):
+            config = console_upgrade.build_device_config(base_config, row, args)
+
+        self.assertEqual(config["jump_host"]["username"], "meraki")
+        self.assertEqual(config["jump_host"]["password"], "jump-pass")
 
 
 if __name__ == "__main__":

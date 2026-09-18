@@ -166,6 +166,28 @@ the WAN interfaces match the appliance.
 | `wan_interfaces` | One or more device interfaces used for DHCP and connectivity. |
 | `timeouts` | Copy, install, reboot, DHCP, prompt, and image-server ping limits. |
 
+For a Telnet console reachable only through an SSH jump host, uncomment the
+proxy block in the YAML example. The tool runs an interactive command equivalent
+to `ssh -tt jump-host telnet device-ip device-port`:
+
+```yaml
+device:
+  connection:
+    proxy: true
+
+jump_host:
+  ip: 172.29.3.64
+  port: 2023
+  username: meraki
+  password: replace-me
+```
+
+The jump-host password can instead be supplied with `JUMP_HOST_PASSWORD`, and
+the username with `JUMP_HOST_USERNAME`. Jump-host credentials are separate from
+the device console credentials. A proxy-enabled connection requires jump-host
+IP, port, username, and password; SSH key-only jump-host authentication is not
+currently supported by the automated password-prompt flow.
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -174,6 +196,8 @@ the WAN interfaces match the appliance.
 | `CONSOLE_PASSWORD` | Default console password. |
 | `ENABLE_PASSWORD` | Enable/secret value used during first boot and privileged EXEC access. |
 | `CONSOLE_FALLBACK_PASSWORD` | Password for fallback cloud-managed username `miles`. |
+| `JUMP_HOST_USERNAME` | Optional SSH jump-host username override when proxy mode is enabled. |
+| `JUMP_HOST_PASSWORD` | Optional SSH jump-host password override when proxy mode is enabled. |
 | `MERAKI_API_KEY` | Meraki Dashboard API key. |
 | `MERAKI_API_BASE_URL` | Optional Dashboard API base URL override. |
 
@@ -232,7 +256,7 @@ Available options:
 | `--csv FILE` | Required device CSV. |
 | `--config FILE` | Required image/device YAML. |
 | `--batch-size N` | Concurrent devices per batch; default `1`. |
-| `--report-dir DIR` | JSON reports and device logs; default `upgrade-reports`. |
+| `--report-dir DIR` | Summary CSV and device logs; default `upgrade-reports`. |
 | `--dry-run` | Validate and print a redacted plan. |
 | `--console-protocol {ssh,telnet}` | Default protocol. |
 | `--console-username USER` | Default console username. |
@@ -301,25 +325,33 @@ device:
 
 ```text
 upgrade-report/
-├── Q4QA-GQ5H-2U74.json
-├── Q4ML-PTXT-SYH2.json
-└── logs/
-    ├── Q4QA-GQ5H-2U74.log
-    └── Q4ML-PTXT-SYH2.log
+├── console-upgrade-summary.csv
+├── Q4QA-GQ5H-2U74.log
+└── Q4ML-PTXT-SYH2.log
 ```
 
 Each device log contains console output, ping attempts, steps, retries, errors,
-and final status. Known credentials are redacted. Each JSON report includes
-batch metadata, the result, any error, and the corresponding log path.
+and final status. Known credentials are redacted. The summary CSV contains the
+appliance serial and a `PASSED` or `FAILED` status in CSV input order. Detailed
+engine results are exchanged through a temporary file and are not retained as
+per-device JSON files.
+
+Example summary:
+
+```csv
+appliance-serial,status
+Q4QA-GQ5H-2U74,PASSED
+Q4ML-PTXT-SYH2,FAILED
+```
 
 View a live Linux/macOS log:
 
 ```bash
-tail -f upgrade-report/logs/Q4QA-GQ5H-2U74.log
+tail -f upgrade-report/Q4QA-GQ5H-2U74.log
 ```
 
 View a live Windows PowerShell log:
 
 ```powershell
-Get-Content .\upgrade-report\logs\Q4QA-GQ5H-2U74.log -Wait
+Get-Content .\upgrade-report\Q4QA-GQ5H-2U74.log -Wait
 ```

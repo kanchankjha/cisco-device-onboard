@@ -1,5 +1,16 @@
 target_version: "26.2"
 
+# Optional SSH jump-host access for a Telnet console.
+# Uncomment this block only when the console must be reached through a proxy.
+# device:
+#   connection:
+#     proxy: true
+# jump_host:
+#   ip: 172.29.3.64
+#   port: 2023
+#   username: meraki
+#   password: replace-me
+
 image:
   destination: "bootflash:"
   skip_if_present: false

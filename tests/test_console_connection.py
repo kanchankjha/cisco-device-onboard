@@ -169,6 +169,25 @@ class ConsoleConnectionTests(unittest.TestCase):
         sent_values = [value for kind, value in child.sent if kind == "sendline"]
         self.assertEqual(sent_values[:4], ["admin", "console-password", "miles", "fallback-password"])
 
+    def test_telnet_proxy_builds_ssh_jump_host_command(self):
+        config = _config()
+        config["device"]["connection"].update({"proxy": True})
+        config["jump_host"] = {
+            "ip": "172.29.3.64",
+            "port": 2023,
+            "username": "meraki",
+            "password": "jump-password",
+        }
+
+        command, args, passwords = ConsoleSession(config)._spawn()
+
+        self.assertEqual(command, "ssh")
+        self.assertEqual(
+            args[-6:],
+            ["-p", "2023", "meraki@172.29.3.64", "telnet", "192.0.2.10", "8235"],
+        )
+        self.assertEqual(passwords, ["jump-password", "console-password"])
+
     def test_ssh_reconnects_with_predefined_username_after_authentication_failure(self):
         first_child = FakeChild([(14, "Permission denied", "")])
         second_child = FakeChild(

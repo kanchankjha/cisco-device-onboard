@@ -85,6 +85,38 @@ wan_interfaces:
 
         self.assertEqual(config["wan_interfaces"], ["Te0/0/8"])
 
+    def test_upgrade_config_accepts_telnet_proxy_configuration(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        handle.write(
+            """
+target_version: "26.2"
+device:
+  connection:
+    proxy: true
+jump_host:
+  ip: 172.29.3.64
+  port: 2023
+  username: meraki
+  password: jump-password
+image:
+  source:
+    path: /images/cat9k.bin
+    server:
+      ip: 192.0.2.20
+      username: image-user
+      password: image-password
+wan_interfaces:
+  - Te0/0/8
+"""
+        )
+        handle.close()
+        self.addCleanup(self.remove_temp_file, Path(handle.name))
+
+        config = load_upgrade_config(Path(handle.name))
+
+        self.assertTrue(config["device"]["connection"]["proxy"])
+        self.assertEqual(config["jump_host"]["port"], 2023)
+
 
 if __name__ == "__main__":
     unittest.main()

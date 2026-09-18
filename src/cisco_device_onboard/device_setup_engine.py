@@ -187,6 +187,14 @@ def load_config(config_path: Path) -> Dict[str, Any]:
     if protocol == "ssh":
         for key in ("username", "password"):
             _required(connection, key, "device.connection")
+    if connection.get("proxy"):
+        jump_host = _mapping(config.get("jump_host"), "jump_host")
+        if os.environ.get("JUMP_HOST_USERNAME", "").strip():
+            jump_host["username"] = os.environ["JUMP_HOST_USERNAME"].strip()
+        if os.environ.get("JUMP_HOST_PASSWORD", "").strip():
+            jump_host["password"] = os.environ["JUMP_HOST_PASSWORD"].strip()
+        for key in ("ip", "username", "password"):
+            _required(jump_host, key, "jump_host")
     for key in ("ip", "username", "password"):
         _required(server, key, "image.source.server")
 
@@ -520,6 +528,7 @@ class ConsoleSession:
             jump_user = str(_required(jump, "username", "jump_host"))
             jump_ip = str(_required(jump, "ip", "jump_host"))
             jump_port = str(jump.get("port", 22))
+            jump_password = str(_required(jump, "password", "jump_host"))
             args = [
                 "-tt",
                 "-o",
@@ -534,9 +543,7 @@ class ConsoleSession:
                 port,
             ]
             passwords = []
-            jump_password = str(jump.get("password", ""))
-            if jump_password:
-                passwords.append(jump_password)
+            passwords.append(jump_password)
             passwords.extend(console_passwords)
             return (
                 "ssh",

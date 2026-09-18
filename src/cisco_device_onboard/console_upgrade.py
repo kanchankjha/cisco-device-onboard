@@ -3,6 +3,7 @@
 import argparse
 import concurrent.futures
 import copy
+import csv
 import json
 import os
 import queue
@@ -121,16 +122,38 @@ def _status_from_engine_line(text: str) -> Optional[str]:
 
 
 def _device_log_path(report_dir: Path, row: DeviceRow) -> Path:
-    return report_dir / "logs" / f"{row.serial}.log"
+    return report_dir / f"{row.serial}.log"
 
 
-def _write_result_report(
-    report_dir: Path, row: DeviceRow, result: Dict[str, Any]
-) -> Path:
+def _summary_status(result: Dict[str, Any]) -> str:
+    return "PASSED" if result.get("result") in {"PASSED", "success", "skipped"} else "FAILED"
+
+
+def _write_summary_csv(report_dir: Path, results: List[Dict[str, Any]]) -> Path:
+    """Write the input-ordered pass/fail summary without exposing per-device JSON."""
+
     report_dir.mkdir(parents=True, exist_ok=True)
-    output_path = report_dir / f"{row.serial}.json"
-    output_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
-    os.chmod(output_path, 0o600)
+    output_path = report_dir / "console-upgrade-summary.csv"
+    temporary_path = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".console-upgrade-summary-",
+            suffix=".tmp",
+            dir=str(report_dir),
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        ordered_results = sorted(results, key=lambda item: int(item.get("row", 0)))
+        with temporary_path.open("w", newline="", encoding="utf-8") as summary_file:
+            writer = csv.writer(summary_file)
+            writer.writerow(["appliance-serial", "status"])
+            for result in ordered_results:
+                writer.writerow([result.get("serial", ""), _summary_status(result)])
+        os.chmod(temporary_path, 0o600)
+        os.replace(str(temporary_path), str(output_path))
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
     return output_path
 
 
@@ -160,6 +183,7 @@ def _known_secrets(config: Dict[str, Any]) -> List[str]:
         str(connection.get("password", "")),
         str(connection.get("enable_password", "")),
         _env_or_empty("CONSOLE_FALLBACK_PASSWORD"),
+        _env_or_empty("JUMP_HOST_PASSWORD"),
         str(server.get("password", "")),
         str(jump.get("password", "")) if isinstance(jump, dict) else "",
     ]
@@ -181,12 +205,29 @@ def build_device_config(base: Dict[str, Any], row: DeviceRow, args: argparse.Nam
         connection["password"] = password
     if enable_password:
         connection["enable_password"] = enable_password
+    if connection.get("proxy"):
+        jump_host = config.get("jump_host")
+        if isinstance(jump_host, dict):
+            jump_host = copy.deepcopy(jump_host)
+            jump_username = _env_or_empty("JUMP_HOST_USERNAME")
+            jump_password = _env_or_empty("JUMP_HOST_PASSWORD")
+            if jump_username:
+                jump_host["username"] = jump_username
+            if jump_password:
+                jump_host["password"] = jump_password
+            config["jump_host"] = jump_host
     config["device"]["name"] = row.serial
     return config
 
 
 def redacted_plan(rows: List[DeviceRow], config: Dict[str, Any]) -> Dict[str, Any]:
     server = config["image"]["source"]["server"]
+    jump_host = config.get("jump_host", {})
+    proxy_enabled = bool(
+        config.get("device", {})
+        .get("connection", {})
+        .get("proxy", False)
+    )
     return {
         "rows": [
             {
@@ -203,6 +244,17 @@ def redacted_plan(rows: List[DeviceRow], config: Dict[str, Any]) -> Dict[str, An
         "imageServer": server.get("ip"),
         "wanInterfaces": config.get("wan_interfaces"),
         "timeouts": config.get("timeouts", {}),
+        "consoleProxy": proxy_enabled,
+        "jumpHost": (
+            {
+                "ip": jump_host.get("ip"),
+                "port": jump_host.get("port", 22),
+                "username": jump_host.get("username")
+                or _env_or_empty("JUMP_HOST_USERNAME"),
+            }
+            if isinstance(jump_host, dict) and proxy_enabled
+            else None
+        ),
     }
 
 
@@ -328,10 +380,9 @@ def upgrade_row(
             )
             result = _redact(result, secrets)
             write_log(f"RESULT {result.get('result', 'FAILED')}\n")
-            output_path = _write_result_report(report_dir, row, result)
             status_emit(
                 f"{prefix} END result={result.get('result', 'FAILED')} "
-                f"log={log_path} report={output_path}"
+                f"log={log_path}"
             )
             return result
 
@@ -362,9 +413,8 @@ def _record_row_failure(
         "error": _redact(str(error), secrets),
         "log_file": str(log_path),
     }
-    output_path = _write_result_report(report_dir, row, result)
     status_emit(
-        f"{_row_prefix(row)} RESULT FAILED log={log_path} report={output_path}"
+        f"{_row_prefix(row)} RESULT FAILED log={log_path}"
     )
     return result
 
@@ -499,6 +549,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 status_printer.emit(f"BATCH {batch_number}/{batch_total} END")
         finally:
             status_printer.close()
+        summary_path = _write_summary_csv(args.report_dir, results)
+        _safe_print(f"Summary CSV: {summary_path}")
         _safe_print(json.dumps({"results": results}, indent=2, default=str))
         return 0 if all(item.get("result") in {"PASSED", "success", "skipped"} for item in results) else 1
     except KeyboardInterrupt:
